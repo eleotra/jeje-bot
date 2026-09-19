@@ -62,9 +62,24 @@ function displayDate(s) {
 }
 
 function scope(owner, env, col = "owner_id") {
-  return owner === String(env.OWNER_ID)
-    ? `(${col} = ? OR ${col} IS NULL)`
-    : `(${col} = ?)`;
+  // HARD WORKSPACE ISOLATION:
+  // Every tenant-scoped query must match the Telegram numeric user ID exactly.
+  // Do not allow NULL/legacy rows to leak into any workspace.
+  return `(${col} = ?)`;
+}
+
+function telegramMention(update) {
+  const user = update?.message?.from || update?.callback_query?.from || {};
+  const id = String(user.id || "");
+  const username = String(user.username || "").trim();
+  const firstName = String(user.first_name || "Seller").trim();
+
+  if (!id) return "Seller";
+
+  // HTML inline mention makes the greeting actually tag/open the Telegram user,
+  // even when Telegram username is unavailable.
+  const label = username ? `@${username}` : firstName;
+  return `<a href="tg://user?id=${id}">${escapeHtml(label)}</a>`;
 }
 
 async function getSession(env, key) {
@@ -118,6 +133,9 @@ function mainKeyboard() {
       [
         { text: "📋 Pesanan" },
         { text: "📅 Hari Ini" }
+      ],
+      [
+        { text: "📊 Rekap Semua" }
       ],
       [
         { text: "👥 Buyers" },
@@ -526,9 +544,11 @@ async function createOrder(
     `✅ <b>Order berhasil dicatat!</b>\n\n` +
     `👤 Buyer: <b>${escapeHtml(username)}</b>\n` +
     `📚 Catalogue: <b>${escapeHtml(
-      (await env.DB.prepare(
-        "SELECT name FROM catalogues WHERE id=?"
-      ).bind(catalogueId).first())?.name || "-"
+      (await env.DB.prepare(`
+        SELECT name
+        FROM catalogues
+        WHERE id=? AND ${scope(owner, env)}
+      `).bind(catalogueId, owner).first())?.name || "-"
     )}</b>\n` +
     `📅 Order: <b>${displayDate(todayISO())}</b>\n` +
     `⏰ Deadline: <b>${escapeHtml(deadline)}</b>\n` +
@@ -921,6 +941,111 @@ async function todayReport(env, chat, owner) {
   });
 }
 
+async function overallReport(env, chat, owner) {
+  const orders = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS total_orders,
+      COALESCE(SUM(o.amount_due),0) AS total_nominal,
+      SUM(CASE WHEN o.status='DONE' THEN 1 ELSE 0 END) AS done_count,
+      SUM(CASE WHEN o.status='UNPAID' THEN 1 ELSE 0 END) AS unpaid_count,
+      SUM(CASE WHEN o.status NOT IN ('DONE','UNPAID') THEN 1 ELSE 0 END) AS pending_count,
+      COALESCE(SUM(
+        CASE
+          WHEN o.amount_due - COALESCE((
+            SELECT SUM(p2.amount)
+            FROM payments p2
+            WHERE p2.order_id=o.id
+          ),0) > 0
+          THEN o.amount_due - COALESCE((
+            SELECT SUM(p3.amount)
+            FROM payments p3
+            WHERE p3.order_id=o.id
+          ),0)
+          ELSE 0
+        END
+      ),0) AS total_piutang,
+      MIN(o.created_at) AS first_order,
+      MAX(o.created_at) AS last_order
+    FROM orders o
+    WHERE ${scope(owner, env, "o.owner_id")}
+  `).bind(owner).first();
+
+  const income = await env.DB.prepare(`
+    SELECT COALESCE(SUM(p.amount),0) AS total
+    FROM payments p
+    JOIN orders o ON o.id=p.order_id
+    WHERE ${scope(owner, env, "o.owner_id")}
+  `).bind(owner).first();
+
+  const expense = await env.DB.prepare(`
+    SELECT COALESCE(SUM(amount),0) AS total
+    FROM expenses
+    WHERE ${scope(owner, env)}
+  `).bind(owner).first();
+
+  const buyers = await env.DB.prepare(`
+    SELECT COUNT(*) AS total
+    FROM buyers
+    WHERE ${scope(owner, env)}
+  `).bind(owner).first();
+
+  const catalogues = await env.DB.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN sell_type='1X' AND stock_status='SOLD' THEN 1 ELSE 0 END) AS sold_count
+    FROM catalogues
+    WHERE ${scope(owner, env)}
+  `).bind(owner).first();
+
+  const totalOrders = Number(orders?.total_orders || 0);
+  const totalNominal = Number(orders?.total_nominal || 0);
+  const doneCount = Number(orders?.done_count || 0);
+  const unpaidCount = Number(orders?.unpaid_count || 0);
+  const pendingCount = Number(orders?.pending_count || 0);
+  const totalIncome = Number(income?.total || 0);
+  const totalExpense = Number(expense?.total || 0);
+  const totalPiutang = Number(orders?.total_piutang || 0);
+  const profit = totalIncome - totalExpense;
+  const totalBuyers = Number(buyers?.total || 0);
+  const totalCatalogues = Number(catalogues?.total || 0);
+  const soldCatalogues = Number(catalogues?.sold_count || 0);
+
+  if (!totalOrders && !totalBuyers && !totalCatalogues && !totalIncome && !totalExpense) {
+    return send(
+      env,
+      chat,
+      `📊 <b>REKAP KESELURUHAN</b>\n\n` +
+      `Belum ada data yang tercatat.\n\n` +
+      `Silakan mulai dengan <b>➕ Tambah Catalogue</b> atau <b>🛒 Order Baru</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  return send(
+    env,
+    chat,
+    `📊 <b>REKAP KESELURUHAN</b>\n\n` +
+    `🛒 <b>TRANSAKSI</b>\n` +
+    `• Total order: <b>${totalOrders}</b>\n` +
+    `• Total nilai order: <b>Rp ${money(totalNominal)}</b>\n` +
+    `• ✅ DONE: <b>${doneCount}</b>\n` +
+    `• ⏳ PENDING: <b>${pendingCount}</b>\n` +
+    `• ❌ UNPAID: <b>${unpaidCount}</b>\n\n` +
+    `💰 <b>KEUANGAN</b>\n` +
+    `• Total income: <b>Rp ${money(totalIncome)}</b>\n` +
+    `• Total modal: <b>Rp ${money(totalExpense)}</b>\n` +
+    `• 📈 Profit: <b>Rp ${money(profit)}</b>\n` +
+    `• 🧾 Piutang: <b>Rp ${money(totalPiutang)}</b>\n\n` +
+    `👥 Total buyer: <b>${totalBuyers}</b>\n` +
+    `📚 Total catalogue: <b>${totalCatalogues}</b>\n` +
+    `🔴 Catalogue 1x SOLD: <b>${soldCatalogues}</b>` +
+    (orders?.first_order
+      ? `\n\n📅 Periode order: <b>${displayDate(orders.first_order)}</b> s/d <b>${displayDate(orders.last_order)}</b>`
+      : ""),
+    { reply_markup: mainKeyboard() }
+  );
+}
+
 async function buyersReport(env, chat, owner) {
   const rows = (
     await env.DB.prepare(`
@@ -990,9 +1115,10 @@ async function handleMessage(env, update) {
     return send(
       env,
       chat,
-      `👋 <b>WELCOME TO CATATAN BA</b>\n\n` +
-      `Bot pribadi untuk mencatat catalogue, order, income, buyer, modal, piutang, dan deadline kamu.\n\n` +
-      `✨ Semua data workspace ini terpisah berdasarkan akun Telegram masing-masing.\n\n` +
+      `👋 <b>HALLO ${telegramMention(update)}!</b>\n\n` +
+      `Selamat datang di <b>CATATAN BA</b> 🫶\n\n` +
+      `Bot pencatatan untuk seller Telegram: catalogue, order, income, buyer, modal, piutang, dan deadline.\n\n` +
+      `🔐 <b>Workspace pribadi:</b> data kamu dipisahkan berdasarkan Telegram User ID dan tidak dicampur dengan seller lain.\n\n` +
       `<i>Credit by @eyshies
 📩 Laporan: hubungi @hzrit</i>`,
       { reply_markup: mainKeyboard() }
@@ -1160,6 +1286,11 @@ async function handleMessage(env, update) {
   if (text === "📅 Hari Ini") {
     await clearSession(env, chat);
     return todayReport(env, chat, owner);
+  }
+
+  if (text === "📊 Rekap Semua") {
+    await clearSession(env, chat);
+    return overallReport(env, chat, owner);
   }
 
   if (text === "👥 Buyers") {

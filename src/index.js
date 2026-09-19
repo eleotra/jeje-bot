@@ -123,6 +123,128 @@ async function clearSession(env, key) {
     .run();
 }
 
+function calculatorResult(expression) {
+  const input = String(expression || "")
+    .replace(/,/g, ".")
+    .replace(/\s+/g, "")
+    .replace(/x/gi, "*");
+
+  if (!input || !/^[0-9+\-*/().]+$/.test(input)) return null;
+
+  const tokens = [];
+  let i = 0;
+  while (i < input.length) {
+    const ch = input[i];
+    if (/\d|\./.test(ch)) {
+      let j = i + 1;
+      while (j < input.length && /[\d.]/.test(input[j])) j++;
+      const n = Number(input.slice(i, j));
+      if (!Number.isFinite(n)) return null;
+      tokens.push({ type: "num", value: n });
+      i = j;
+      continue;
+    }
+    if ("+-*/()".includes(ch)) {
+      tokens.push({ type: ch, value: ch });
+      i++;
+      continue;
+    }
+    return null;
+  }
+
+  const values = [];
+  const ops = [];
+  const precedence = { "+": 1, "-": 1, "*": 2, "/": 2 };
+  const apply = () => {
+    const op = ops.pop();
+    const b = values.pop();
+    const a = values.pop();
+    if (a === undefined || b === undefined) throw new Error("bad expression");
+    if (op === "+") values.push(a + b);
+    else if (op === "-") values.push(a - b);
+    else if (op === "*") values.push(a * b);
+    else if (op === "/") {
+      if (b === 0) throw new Error("divide by zero");
+      values.push(a / b);
+    }
+  };
+
+  try {
+    let expectValue = true;
+    for (let k = 0; k < tokens.length; k++) {
+      const t = tokens[k];
+      if (t.type === "num") {
+        values.push(t.value);
+        expectValue = false;
+      } else if (t.type === "(") {
+        ops.push(t.type);
+        expectValue = true;
+      } else if (t.type === ")") {
+        if (expectValue) throw new Error("bad expression");
+        while (ops.length && ops.at(-1) !== "(") apply();
+        if (ops.pop() !== "(") throw new Error("bad expression");
+        expectValue = false;
+      } else {
+        if (expectValue) {
+          // Support unary + and - by inserting a leading zero.
+          if (t.type === "+" || t.type === "-") values.push(0);
+          else throw new Error("bad expression");
+        }
+        while (
+          ops.length &&
+          ops.at(-1) !== "(" &&
+          precedence[ops.at(-1)] >= precedence[t.type]
+        ) apply();
+        ops.push(t.type);
+        expectValue = true;
+      }
+    }
+    if (expectValue) throw new Error("bad expression");
+    while (ops.length) {
+      if (ops.at(-1) === "(") throw new Error("bad expression");
+      apply();
+    }
+    const result = values[0];
+    return values.length === 1 && Number.isFinite(result) ? result : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatCalculatorResult(n) {
+  if (!Number.isFinite(n)) return "-";
+  const rounded = Math.abs(n) < 1e12 ? Number(n.toFixed(10)) : n;
+  return new Intl.NumberFormat("id-ID", { maximumFractionDigits: 10 }).format(rounded);
+}
+
+function catalogueInput(value) {
+  const raw = String(value || "").trim();
+  // Expected: "01 8,000" or "01 - 8,000". The price is kept in the
+  // catalogue label so this change does not require a schema migration.
+  const match = raw.match(/^(.+?)\s+(?:[-:]\s*)?([0-9][0-9.,]*)$/);
+  if (!match) return null;
+  const name = match[1].trim();
+  const price = parseMoney(match[2]);
+  if (!name || !Number.isFinite(price) || price <= 0) return null;
+  return { name, price, label: `${name} — Rp ${money(price)}` };
+}
+
+function helpText() {
+  return `📖 <b>PANDUAN CATATAN BA</b>\n\n` +
+    `<b>Catalogue</b>\nTambah dan kelola catalogue jualan. Saat membuat catalogue, masukkan nama + harga, misalnya <code>01 8,000</code>. Link Telegram boleh dikosongkan.\n\n` +
+    `<b>Order Baru</b>\nPilih catalogue, masukkan buyer dan nominal order, lalu deadline jika diperlukan.\n\n` +
+    `<b>Pesanan</b>\nLihat dan kelola order yang sudah dicatat, termasuk pembayaran dan statusnya.\n\n` +
+    `<b>Buyers</b>\nLihat buyer dan riwayat jumlah ordernya.\n\n` +
+    `<b>Keuangan</b>\nPantau pemasukan, modal, profit, dan piutang.\n\n` +
+    `<b>Deadline</b>\nLihat order yang masih memiliki deadline aktif.\n\n` +
+    `<b>Hari Ini</b>\nRekap aktivitas hari ini.\n\n` +
+    `<b>Rekap Semua</b>\nRekap seluruh riwayat data yang tersimpan.\n\n` +
+    `<b>Kalkulator</b>\nHitung operasi sederhana seperti <code>10000+5000</code>, <code>100000-25000</code>, atau <code>5000*3</code>.\n\n` +
+    `<b>Catalogue 1x Sell</b>\nAkan otomatis menjadi SOLD setelah order selesai (DONE).\n\n` +
+    `Data setiap seller dipisahkan berdasarkan akun Telegram masing-masing.\n\n` +
+    `<i>- Tutorial selengkapnya di ch @eyshies</i>`;
+}
+
 function mainKeyboard() {
   return {
     keyboard: [
@@ -150,9 +272,11 @@ function mainKeyboard() {
         { text: "🗑️ Hapus Catalogue" }
       ],
       [
-        { text: "💸 Tambah Modal" }
+        { text: "💸 Tambah Modal" },
+        { text: "🧮 Kalkulator" }
       ],
       [
+        { text: "📖 Panduan" },
         { text: "ℹ️ About" }
       ]
     ],
@@ -251,7 +375,8 @@ async function chooseEditCatalogue(env, chat, owner, id) {
     `Nama sekarang: <b>${escapeHtml(row.name)}</b>\n` +
     `Link sekarang: <code>${escapeHtml(row.link)}</code>\n` +
     `Tipe: <b>${escapeHtml(row.sell_type)}</b>\n\n` +
-    `Kirim format:\n<code>Nama Catalogue | https://link</code>`
+    `Kirim format:\n<code>Nama Catalogue | https://link</code>\n` +
+    `Kalau tanpa link: <code>Nama Catalogue | -</code>`
   );
 }
 
@@ -1171,14 +1296,15 @@ async function handleMessage(env, update) {
   }
 
   if (text === "➕ Tambah Catalogue") {
-    await setSession(env, chat, "CATALOGUE_NAME");
+    await setSession(env, chat, "CATALOGUE_NAME_PRICE");
 
     return send(
       env,
       chat,
       `➕ <b>TAMBAH CATALOGUE</b>\n\n` +
-      `Masukkan <b>nama catalogue</b> terlebih dahulu.\n\n` +
-      `Contoh:\n<code>Catalogue September</code>`
+      `Masukkan <b>nama catalogue + harga</b>.\n\n` +
+      `Contoh:\n<code>01 8,000</code>\n\n` +
+      `Harga akan ikut tampil pada catalogue. Setelah itu kamu bisa memasukkan link Telegram, atau langsung lewati jika tidak ada.`
     );
   }
 
@@ -1427,23 +1553,40 @@ async function handleMessage(env, update) {
     );
   }
 
+  if (text === "🧮 Kalkulator") {
+    await setSession(env, chat, "CALCULATOR");
+
+    return send(
+      env,
+      chat,
+      `🧮 <b>KALKULATOR</b>\n\n` +
+      `Ketik perhitungan yang mau dihitung.\n\n` +
+      `Contoh:\n` +
+      `<code>10000+5000</code>\n` +
+      `<code>100000-25000</code>\n` +
+      `<code>5000*3</code>\n` +
+      `<code>100000/4</code>\n` +
+      `<code>(5000+3000)*2</code>\n\n` +
+      `Ketik <code>selesai</code> untuk kembali ke menu.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (text === "📖 Panduan") {
+    await clearSession(env, chat);
+    return send(env, chat, helpText(), { reply_markup: mainKeyboard() });
+  }
+
   if (text === "ℹ️ About") {
     await clearSession(env, chat);
 
     return send(
       env,
       chat,
-      `ℹ️ <b>ABOUT CATATAN BA</b>\n\n` +
-      `JEJE adalah bot pribadi untuk membantu mencatat dan mengelola orderan.\n\n` +
-      `📚 Catalogue\n` +
-      `🛒 Order\n` +
-      `👥 Buyer\n` +
-      `💰 Income\n` +
-      `💸 Modal\n` +
-      `🧾 Piutang\n` +
-      `⏰ Deadline\n\n` +
-      `<i>Credit by @eyshies
-📩 Laporan: hubungi @hzrit</i>`,
+      `ℹ️ <b>CATATAN BA</b>\n\n` +
+      `Bot pencatatan jualan untuk seller Telegram.\n` +
+      `Catalogue, order, buyer, keuangan, dan rekap dalam satu bot.\n\n` +
+      `<i>Credit by @eyshies\n📩 Laporan: hubungi @hzrit</i>`,
       { reply_markup: mainKeyboard() }
     );
   }
@@ -1462,86 +1605,110 @@ async function handleMessage(env, update) {
     );
   }
 
-  if (session.state === "CATALOGUE_NAME") {
-    const name = text.trim();
+  if (session.state === "CATALOGUE_NAME_PRICE") {
+    const parsed = catalogueInput(text);
 
-    if (!name) {
-      return send(env, chat, "❌ Nama catalogue tidak boleh kosong.");
+    if (!parsed) {
+      return send(
+        env,
+        chat,
+        `❌ Format catalogue salah.\n\nGunakan contoh:\n<code>01 8,000</code>`
+      );
     }
 
-    await setSession(env, chat, "CATALOGUE_LINK", { name });
+    await setSession(env, chat, "CATALOGUE_LINK", {
+      name: parsed.label,
+      price: parsed.price
+    });
 
     return send(
       env,
       chat,
-      `📚 Nama catalogue: <b>${escapeHtml(name)}</b>\n\n` +
-      `Sekarang masukkan <b>link postingan Telegram</b>.\n\n` +
-      `Contoh:\n<code>https://t.me/namachannel/123</code>`
+      `📚 Catalogue: <b>${escapeHtml(parsed.name)}</b>\n` +
+      `💰 Harga: <b>Rp ${money(parsed.price)}</b>\n\n` +
+      `Masukkan <b>link postingan Telegram</b>.\n` +
+      `Kalau tidak ada link, balas <code>-</code>.\n\n` +
+      `Contoh: <code>https://t.me/namachannel/123</code>`
     );
   }
 
-if (session.state === "CATALOGUE_LINK") {
-  const link = text.trim();
+  if (session.state === "CATALOGUE_LINK") {
+    const link = text === "-" ? "" : text.trim();
 
-  if (!/^https?:\/\/\S+$/i.test(link)) {
+    if (link && !/^https?:\/\/\S+$/i.test(link)) {
+      return send(
+        env,
+        chat,
+        `❌ Link tidak valid.\n\nMasukkan link <code>https://...</code> atau balas <code>-</code> jika tidak ada link.`
+      );
+    }
+
+    await setSession(env, chat, "CATALOGUE_TYPE", {
+      name: session.data.name,
+      price: session.data.price,
+      link
+    });
+
     return send(
       env,
       chat,
-      "❌ Link tidak valid.\n\nMasukkan link yang diawali <code>https://</code>."
-    );
-  }
-
-  await setSession(env, chat, "CATALOGUE_TYPE", {
-    name: session.data.name,
-    link
-  });
-
-  return send(
-    env,
-    chat,
-    `🔗 Link berhasil diterima.\n\n` +
-    `📚 Catalogue: <b>${escapeHtml(session.data.name)}</b>\n\n` +
-    `Pilih tipe catalogue:`,
-    {
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "♾️ Unlimited",
-              callback_data: "cat_type:UNLIMITED"
-            }
-          ],
-          [
-            {
-              text: "🏷️ 1x Sell",
-              callback_data: "cat_type:1X"
-            }
-          ],
-          [
-            {
-              text: "❌ Batal",
-              callback_data: "cancel"
-            }
+      `📚 Catalogue: <b>${escapeHtml(session.data.name)}</b>\n` +
+      `💰 Harga: <b>Rp ${money(session.data.price)}</b>\n` +
+      `${link ? `🔗 ${escapeHtml(link)}\n` : `🔗 Link: <b>-</b>\n`}\n` +
+      `Pilih tipe catalogue:`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "♾️ Unlimited", callback_data: "cat_type:UNLIMITED" }],
+            [{ text: "🏷️ 1x Sell", callback_data: "cat_type:1X" }],
+            [{ text: "❌ Batal", callback_data: "cancel" }]
           ]
-        ]
+        }
       }
+    );
+  }
+
+  if (session.state === "CALCULATOR") {
+    if (text.toLowerCase() === "selesai" || text === "❌ Batal") {
+      await clearSession(env, chat);
+      return send(env, chat, "Kalkulator ditutup.", { reply_markup: mainKeyboard() });
     }
-  );
-}
+
+    const result = calculatorResult(text);
+    if (result === null) {
+      return send(
+        env,
+        chat,
+        `❌ Perhitungan tidak valid.\n\nContoh: <code>10000+5000</code> atau <code>(5000+3000)*2</code>`
+      );
+    }
+
+    return send(
+      env,
+      chat,
+      `🧮 <b>HASIL</b>\n\n` +
+      `<code>${escapeHtml(text)}</code> = <b>${formatCalculatorResult(result)}</b>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
 
   if (session.state === "EDIT_CATALOGUE") {
-    const match = text.match(/^(.+?)\s*\|\s*(https?:\/\/\S+)$/i);
+    const match = text.match(/^(.+?)\s*\|\s*(.*)$/);
 
     if (!match) {
       return send(
         env,
         chat,
-        "❌ Format salah.\n\nGunakan:\n<code>Nama Catalogue | https://link</code>"
+        "❌ Format salah.\n\nGunakan:\n<code>Nama Catalogue | https://link</code>\natau\n<code>Nama Catalogue | -</code>"
       );
     }
 
     const name = match[1].trim();
-    const link = match[2].trim();
+    const link = match[2].trim() === "-" ? "" : match[2].trim();
+
+    if (link && !/^https?:\/\/\S+$/i.test(link)) {
+      return send(env, chat, "❌ Link tidak valid. Gunakan <code>https://...</code> atau <code>-</code>.");
+    }
 
     if (!name) {
       return send(env, chat, "❌ Nama catalogue tidak boleh kosong.");
@@ -1754,7 +1921,7 @@ async function handleCallback(env, update) {
       chat,
       `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
       `📚 Nama: <b>${escapeHtml(name)}</b>\n` +
-      `🔗 ${escapeHtml(link)}\n` +
+      `${link ? `🔗 ${escapeHtml(link)}\n` : `🔗 Link: <b>-</b>\n`}` +
       `🏷️ Tipe: <b>${typeText}</b>\n` +
       `🟢 Status: <b>AVAILABLE</b>`,
       { reply_markup: mainKeyboard() }

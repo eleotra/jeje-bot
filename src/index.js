@@ -1233,7 +1233,7 @@ async function handleMessage(env, update) {
   if (session.state === "CATALOGUE_LINK") {
     const link = text.trim();
 
-    if (!/^https?:\\/\\/\\S+$/i.test(link)) {
+    if (!/^https?:\/\/\S+$/i.test(link)) {
       return send(
         env,
         chat,

@@ -1137,47 +1137,7 @@ async function todayReport(env, chat, owner) {
   });
 }
 
-async function buyersReport(env, chat, owner) {
-  const rows = (
-    await env.DB.prepare(`
-      SELECT
-        b.id,
-        b.username,
-        COUNT(o.id) AS total_orders,
-        COALESCE(SUM(o.amount_due),0) AS total_nominal
-      FROM buyers b
-      LEFT JOIN orders o ON o.buyer_id=b.id
-        AND ${scope(owner, env, "o.owner_id")}
-      WHERE ${scope(owner, env, "b.owner_id")}
-      GROUP BY b.id,b.username
-      ORDER BY b.id DESC
-    `)
-      .bind(owner, owner)
-      .all()
-  ).results || [];
 
-  if (!rows.length) {
-    return send(
-      env,
-      chat,
-      "👥 <b>Belum ada buyer.</b>",
-      { reply_markup: mainKeyboard() }
-    );
-  }
-
-  let text = "👥 <b>BUYERS</b>\n\n";
-
-  rows.forEach((r, i) => {
-    text +=
-      `<b>${i + 1}. ${escapeHtml(r.username)}</b>\n` +
-      `🛒 Order: ${r.total_orders}\n` +
-      `💰 Total nominal: Rp ${money(r.total_nominal)}\n\n`;
-  });
-
-  return send(env, chat, text.trim(), {
-    reply_markup: mainKeyboard()
-  });
-    }
 async function setupWebhook(env, request) {
   const url = new URL(request.url);
   const secret = url.searchParams.get("secret");

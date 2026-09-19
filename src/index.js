@@ -128,7 +128,10 @@ function mainKeyboard() {
         { text: "➕ Tambah Catalogue" }
       ],
       [
-        { text: "🗑️ Hapus Catalogue" },
+        { text: "✏️ Edit Catalogue" },
+        { text: "🗑️ Hapus Catalogue" }
+      ],
+      [
         { text: "💸 Tambah Modal" }
       ],
       [
@@ -173,6 +176,92 @@ async function catalogueRows(env, owner) {
       .bind(owner)
       .all()
   ).results || [];
+}
+
+async function showEditCatalogue(env, chat, owner) {
+  await clearSession(env, chat);
+  const rows = await catalogueRows(env, owner);
+
+  if (!rows.length) {
+    return send(env, chat, "✏️ Belum ada catalogue yang bisa diedit.", {
+      reply_markup: mainKeyboard()
+    });
+  }
+
+  const buttons = rows.map((r) => [
+    {
+      text: `✏️ ${r.name}`,
+      callback_data: `editcat:${r.id}`
+    }
+  ]);
+
+  buttons.push([{ text: "❌ Batal", callback_data: "cancel" }]);
+
+  return send(
+    env,
+    chat,
+    "✏️ <b>EDIT CATALOGUE</b>\n\nPilih catalogue yang ingin diedit:",
+    {
+      reply_markup: { inline_keyboard: buttons }
+    }
+  );
+}
+
+async function chooseEditCatalogue(env, chat, owner, id) {
+  const row = await env.DB.prepare(`
+    SELECT id,name,link,sell_type,stock_status
+    FROM catalogues
+    WHERE id=? AND ${scope(owner, env)}
+  `).bind(id, owner).first();
+
+  if (!row) {
+    return send(env, chat, "❌ Catalogue tidak ditemukan.");
+  }
+
+  await setSession(env, chat, "EDIT_CATALOGUE", {
+    catalogueId: row.id,
+    name: row.name,
+    link: row.link,
+    sellType: row.sell_type,
+    stockStatus: row.stock_status
+  });
+
+  return send(
+    env,
+    chat,
+    `✏️ <b>EDIT CATALOGUE</b>\n\n` +
+    `Nama sekarang: <b>${escapeHtml(row.name)}</b>\n` +
+    `Link sekarang: <code>${escapeHtml(row.link)}</code>\n` +
+    `Tipe: <b>${escapeHtml(row.sell_type)}</b>\n\n` +
+    `Kirim format:\n<code>Nama Catalogue | https://link</code>`
+  );
+}
+
+async function saveEditedCatalogue(env, chat, owner, data, name, link) {
+  const result = await env.DB.prepare(`
+    UPDATE catalogues
+    SET name=?, link=?
+    WHERE id=? AND ${scope(owner, env)}
+  `).bind(name, link, data.catalogueId, owner).run();
+
+  if (!result.success) {
+    return send(env, chat, "❌ Catalogue gagal diperbarui.", {
+      reply_markup: mainKeyboard()
+    });
+  }
+
+  await clearSession(env, chat);
+
+  return send(
+    env,
+    chat,
+    `✅ <b>Catalogue berhasil diedit!</b>\n\n` +
+    `📚 Nama: <b>${escapeHtml(name)}</b>\n` +
+    `🔗 ${escapeHtml(link)}\n` +
+    `🏷️ Tipe: <b>${escapeHtml(data.sellType)}</b>\n` +
+    `📌 Status: <b>${escapeHtml(data.stockStatus || "AVAILABLE")}</b>`,
+    { reply_markup: mainKeyboard() }
+  );
 }
 
 async function confirmDeleteCatalogue(env, chat, owner, id) {
@@ -321,7 +410,7 @@ async function chooseOrderCatalogue(env, chat, owner, catalogueId) {
     chat,
     `📚 Catalogue: <b>${escapeHtml(row.name)}</b>\n\n` +
     `Sekarang masukkan <b>username buyer + nominal</b>.\n\n` +
-    `Contoh:\n<code>@jpesek 5,000</code>\n\n` +
+    `Contoh:\n<code>@buyer123 5,000</code>\n\n` +
     `Tanpa tanda <code>|</code> ya.`
   );
 }
@@ -552,16 +641,12 @@ async function markOrder(env, chat, owner, orderId, action) {
       .run();
 
         const orderCatalogue = await env.DB.prepare(`
-  SELECT catalogue_id
-  FROM orders
-  WHERE id=? AND ${scope(owner, env, "owner_id")}
-`)
-  .bind(
-    ...(owner === String(env.OWNER_ID)
-      ? [orderId, owner, owner]
-      : [orderId, owner])
-  )
-  .first();
+    SELECT catalogue_id
+    FROM orders
+    WHERE id=? AND ${scope(owner, env, "owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
 
 if (orderCatalogue?.catalogue_id) {
   await env.DB.prepare(`
@@ -571,11 +656,7 @@ if (orderCatalogue?.catalogue_id) {
       AND sell_type='1X'
       AND ${scope(owner, env)}
   `)
-    .bind(
-      ...(owner === String(env.OWNER_ID)
-        ? [orderCatalogue.catalogue_id, owner, owner]
-        : [orderCatalogue.catalogue_id, owner])
-    )
+.bind(orderCatalogue.catalogue_id, owner)
     .run();
 }
     
@@ -889,12 +970,12 @@ async function handleMessage(env, update) {
 
   if (!chat || !owner) return;
 
-  // JEJE hanya bekerja di private chat
+  // CATATAN BA hanya bekerja di private chat
   if (!isPrivate(update)) {
     return send(
       env,
       chat,
-      "🔒 JEJE STORE hanya bisa digunakan melalui private chat."
+      "🔒 CATATAN BA hanya bisa digunakan melalui private chat."
     );
   }
 
@@ -909,10 +990,11 @@ async function handleMessage(env, update) {
     return send(
       env,
       chat,
-      `👋 <b>WELCOME TO JEJE STORE</b>\n\n` +
+      `👋 <b>WELCOME TO CATATAN BA</b>\n\n` +
       `Bot pribadi untuk mencatat catalogue, order, income, buyer, modal, piutang, dan deadline kamu.\n\n` +
       `✨ Semua data workspace ini terpisah berdasarkan akun Telegram masing-masing.\n\n` +
-      `<i>Credit by @jpesek — @eyshies</i>`,
+      `<i>Credit by @eyshies
+📩 Laporan: hubungi @hzrit</i>`,
       { reply_markup: mainKeyboard() }
     );
   }
@@ -972,6 +1054,10 @@ async function handleMessage(env, update) {
       `Masukkan <b>nama catalogue</b> terlebih dahulu.\n\n` +
       `Contoh:\n<code>Catalogue September</code>`
     );
+  }
+
+  if (text === "✏️ Edit Catalogue") {
+    return showEditCatalogue(env, chat, owner);
   }
 
   if (text === "🗑️ Hapus Catalogue") {
@@ -1216,7 +1302,7 @@ async function handleMessage(env, update) {
     return send(
       env,
       chat,
-      `ℹ️ <b>ABOUT JEJE STORE</b>\n\n` +
+      `ℹ️ <b>ABOUT CATATAN BA</b>\n\n` +
       `JEJE adalah bot pribadi untuk membantu mencatat dan mengelola orderan.\n\n` +
       `📚 Catalogue\n` +
       `🛒 Order\n` +
@@ -1225,7 +1311,8 @@ async function handleMessage(env, update) {
       `💸 Modal\n` +
       `🧾 Piutang\n` +
       `⏰ Deadline\n\n` +
-      `<i>Credit by @jpesek — @eyshies</i>`,
+      `<i>Credit by @eyshies
+📩 Laporan: hubungi @hzrit</i>`,
       { reply_markup: mainKeyboard() }
     );
   }
@@ -1311,6 +1398,27 @@ if (session.state === "CATALOGUE_LINK") {
   );
 }
 
+  if (session.state === "EDIT_CATALOGUE") {
+    const match = text.match(/^(.+?)\s*\|\s*(https?:\/\/\S+)$/i);
+
+    if (!match) {
+      return send(
+        env,
+        chat,
+        "❌ Format salah.\n\nGunakan:\n<code>Nama Catalogue | https://link</code>"
+      );
+    }
+
+    const name = match[1].trim();
+    const link = match[2].trim();
+
+    if (!name) {
+      return send(env, chat, "❌ Nama catalogue tidak boleh kosong.");
+    }
+
+    return saveEditedCatalogue(env, chat, owner, session.data, name, link);
+  }
+
   if (session.state === "ORDER_BUYER") {
     const match = text.match(/^(@[A-Za-z0-9_]+)\s+(.+)$/);
 
@@ -1318,7 +1426,7 @@ if (session.state === "CATALOGUE_LINK") {
       return send(
         env,
         chat,
-        `❌ Format salah.\n\nGunakan:\n<code>@jpesek 5,000</code>`
+        `❌ Format salah.\n\nGunakan:\n<code>@buyer123 5,000</code>`
       );
     }
 
@@ -1329,7 +1437,7 @@ if (session.state === "CATALOGUE_LINK") {
       return send(
         env,
         chat,
-        "❌ Nominal tidak valid.\n\nContoh: <code>@jpesek 5,000</code>"
+        "❌ Nominal tidak valid.\n\nContoh: <code>@buyer123 5,000</code>"
       );
     }
 
@@ -1443,65 +1551,6 @@ if (session.state === "CATALOGUE_LINK") {
     );
   }
 
-  if (data.startsWith("cat_type:")) {
-  const sellType = data.split(":")[1];
-
-  if (sellType !== "UNLIMITED" && sellType !== "1X") {
-    return send(env, chat, "❌ Tipe catalogue tidak valid.");
-  }
-
-  const session = await getSession(env, chat);
-
-  if (!session || session.state !== "CATALOGUE_TYPE") {
-    return send(
-      env,
-      chat,
-      "⚠️ Sesi tambah catalogue sudah tidak berlaku.",
-      { reply_markup: mainKeyboard() }
-    );
-  }
-
-  const name = session.data.name;
-  const link = session.data.link;
-
-  await env.DB.prepare(`
-    INSERT INTO catalogues(
-      name,
-      link,
-      owner_id,
-      sell_type,
-      stock_status
-    )
-    VALUES(?,?,?,?,?)
-  `)
-    .bind(
-      name,
-      link,
-      owner,
-      sellType,
-      "AVAILABLE"
-    )
-    .run();
-
-  await clearSession(env, chat);
-
-  const typeText =
-    sellType === "1X"
-      ? "🏷️ 1x Sell"
-      : "♾️ Unlimited";
-
-  return send(
-    env,
-    chat,
-    `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
-    `📚 Nama: <b>${escapeHtml(name)}</b>\n` +
-    `🔗 ${escapeHtml(link)}\n` +
-    `🏷️ Tipe: <b>${typeText}</b>\n` +
-    `🟢 Status: <b>AVAILABLE</b>`,
-    { reply_markup: mainKeyboard() }
-  );
-  }
-  
   await clearSession(env, chat);
 
   return send(
@@ -1539,6 +1588,48 @@ async function handleCallback(env, update) {
     );
   }
 
+  if (data.startsWith("cat_type:")) {
+    const sellType = data.split(":")[1];
+
+    if (sellType !== "UNLIMITED" && sellType !== "1X") {
+      return send(env, chat, "❌ Tipe catalogue tidak valid.");
+    }
+
+    const session = await getSession(env, chat);
+
+    if (!session || session.state !== "CATALOGUE_TYPE") {
+      return send(
+        env,
+        chat,
+        "⚠️ Sesi tambah catalogue sudah tidak berlaku.",
+        { reply_markup: mainKeyboard() }
+      );
+    }
+
+    const name = session.data.name;
+    const link = session.data.link;
+
+    await env.DB.prepare(`
+      INSERT INTO catalogues(name,link,owner_id,sell_type,stock_status)
+      VALUES(?,?,?,?,?)
+    `).bind(name, link, owner, sellType, "AVAILABLE").run();
+
+    await clearSession(env, chat);
+
+    const typeText = sellType === "1X" ? "🏷️ 1x Sell" : "♾️ Unlimited";
+
+    return send(
+      env,
+      chat,
+      `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
+      `📚 Nama: <b>${escapeHtml(name)}</b>\n` +
+      `🔗 ${escapeHtml(link)}\n` +
+      `🏷️ Tipe: <b>${typeText}</b>\n` +
+      `🟢 Status: <b>AVAILABLE</b>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
   if (data.startsWith("ordercat:")) {
     const id = Number(data.split(":")[1]);
 
@@ -1550,6 +1641,12 @@ async function handleCallback(env, update) {
       owner,
       id
     );
+  }
+
+  if (data.startsWith("editcat:")) {
+    const id = Number(data.split(":")[1]);
+    if (!Number.isFinite(id)) return;
+    return chooseEditCatalogue(env, chat, owner, id);
   }
 
   if (data.startsWith("delcat:")) {
@@ -1690,7 +1787,7 @@ export default {
 
       if (url.pathname === "/") {
         return new Response(
-          "JEJE STORE BOT is running.",
+          "CATATAN BA BOT is running.",
           {
             headers: {
               "content-type": "text/plain"
@@ -1729,7 +1826,7 @@ export default {
           error: String(error?.message || error)
         }),
         {
-          status: 500,
+          status: 200,
           headers: {
             "content-type": "application/json"
           }

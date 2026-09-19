@@ -165,7 +165,7 @@ function escapeHtml(s) {
 async function catalogueRows(env, owner) {
   return (
     await env.DB.prepare(`
-      SELECT id,name,link,created_at
+      SELECT id,name,link,sell_type,stock_status,created_at
       FROM catalogues
       WHERE ${scope(owner, env)}
       ORDER BY id
@@ -257,8 +257,12 @@ async function deleteCatalogue(env, chat, owner, id) {
 }
 
 async function startOrder(env, chat, owner) {
-  const rows = await catalogueRows(env, owner);
+  const allRows = await catalogueRows(env, owner);
 
+  const rows = allRows.filter(
+    (r) => !(r.sell_type === "1X" && r.stock_status === "SOLD")
+  );
+  
   if (!rows.length) {
     return send(
       env,
@@ -547,6 +551,34 @@ async function markOrder(env, chat, owner, orderId, action) {
       .bind(orderId, owner)
       .run();
 
+        const orderCatalogue = await env.DB.prepare(`
+  SELECT catalogue_id
+  FROM orders
+  WHERE id=? AND ${scope(owner, env, "owner_id")}
+`)
+  .bind(
+    ...(owner === String(env.OWNER_ID)
+      ? [orderId, owner, owner]
+      : [orderId, owner])
+  )
+  .first();
+
+if (orderCatalogue?.catalogue_id) {
+  await env.DB.prepare(`
+    UPDATE catalogues
+    SET stock_status='SOLD'
+    WHERE id=?
+      AND sell_type='1X'
+      AND ${scope(owner, env)}
+  `)
+    .bind(
+      ...(owner === String(env.OWNER_ID)
+        ? [orderCatalogue.catalogue_id, owner, owner]
+        : [orderCatalogue.catalogue_id, owner])
+    )
+    .run();
+}
+    
     return send(
       env,
       chat,
@@ -1230,35 +1262,54 @@ async function handleMessage(env, update) {
     );
   }
 
-  if (session.state === "CATALOGUE_LINK") {
-    const link = text.trim();
+if (session.state === "CATALOGUE_LINK") {
+  const link = text.trim();
 
-    if (!/^https?:\/\/\S+$/i.test(link)) {
-      return send(
-        env,
-        chat,
-        "❌ Link tidak valid.\n\nMasukkan link Telegram yang diawali <code>https://</code>."
-      );
-    }
-
-    await env.DB.prepare(`
-      INSERT INTO catalogues(name,link,owner_id)
-      VALUES(?,?,?)
-    `)
-      .bind(session.data.name, link, owner)
-      .run();
-
-    await clearSession(env, chat);
-
+  if (!/^https?:\/\/\S+$/i.test(link)) {
     return send(
       env,
       chat,
-      `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
-      `📚 Nama: <b>${escapeHtml(session.data.name)}</b>\n` +
-      `🔗 ${escapeHtml(link)}`,
-      { reply_markup: mainKeyboard() }
+      "❌ Link tidak valid.\n\nMasukkan link yang diawali <code>https://</code>."
     );
   }
+
+  await setSession(env, chat, "CATALOGUE_TYPE", {
+    name: session.data.name,
+    link
+  });
+
+  return send(
+    env,
+    chat,
+    `🔗 Link berhasil diterima.\n\n` +
+    `📚 Catalogue: <b>${escapeHtml(session.data.name)}</b>\n\n` +
+    `Pilih tipe catalogue:`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "♾️ Unlimited",
+              callback_data: "cat_type:UNLIMITED"
+            }
+          ],
+          [
+            {
+              text: "🏷️ 1x Sell",
+              callback_data: "cat_type:1X"
+            }
+          ],
+          [
+            {
+              text: "❌ Batal",
+              callback_data: "cancel"
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
 
   if (session.state === "ORDER_BUYER") {
     const match = text.match(/^(@[A-Za-z0-9_]+)\s+(.+)$/);
@@ -1392,6 +1443,65 @@ async function handleMessage(env, update) {
     );
   }
 
+  if (data.startsWith("cat_type:")) {
+  const sellType = data.split(":")[1];
+
+  if (sellType !== "UNLIMITED" && sellType !== "1X") {
+    return send(env, chat, "❌ Tipe catalogue tidak valid.");
+  }
+
+  const session = await getSession(env, chat);
+
+  if (!session || session.state !== "CATALOGUE_TYPE") {
+    return send(
+      env,
+      chat,
+      "⚠️ Sesi tambah catalogue sudah tidak berlaku.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  const name = session.data.name;
+  const link = session.data.link;
+
+  await env.DB.prepare(`
+    INSERT INTO catalogues(
+      name,
+      link,
+      owner_id,
+      sell_type,
+      stock_status
+    )
+    VALUES(?,?,?,?,?)
+  `)
+    .bind(
+      name,
+      link,
+      owner,
+      sellType,
+      "AVAILABLE"
+    )
+    .run();
+
+  await clearSession(env, chat);
+
+  const typeText =
+    sellType === "1X"
+      ? "🏷️ 1x Sell"
+      : "♾️ Unlimited";
+
+  return send(
+    env,
+    chat,
+    `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
+    `📚 Nama: <b>${escapeHtml(name)}</b>\n` +
+    `🔗 ${escapeHtml(link)}\n` +
+    `🏷️ Tipe: <b>${typeText}</b>\n` +
+    `🟢 Status: <b>AVAILABLE</b>`,
+    { reply_markup: mainKeyboard() }
+  );
+  }
+  
   await clearSession(env, chat);
 
   return send(

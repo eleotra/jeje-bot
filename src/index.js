@@ -850,6 +850,686 @@ async function buyersReport(env, chat, owner) {
   });
 }
 
+async function handleMessage(env, update) {
+  const chat = chatId(update);
+  const owner = ownerId(update);
+  const text = String(update?.message?.text || "").trim();
+
+  if (!chat || !owner) return;
+
+  // JEJE hanya bekerja di private chat
+  if (!isPrivate(update)) {
+    return send(
+      env,
+      chat,
+      "🔒 JEJE STORE hanya bisa digunakan melalui private chat."
+    );
+  }
+
+  // START / MENU / HAI
+  if (
+    text === "/start" ||
+    text === "/menu" ||
+    text.toLowerCase() === "hai"
+  ) {
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      `👋 <b>WELCOME TO JEJE STORE</b>\n\n` +
+      `Bot pribadi untuk mencatat catalogue, order, income, buyer, modal, piutang, dan deadline kamu.\n\n` +
+      `✨ Semua data workspace ini terpisah berdasarkan akun Telegram masing-masing.\n\n` +
+      `<i>Credit by @jpesek — @eyshies</i>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  // BATAL
+  if (text === "❌ Batal") {
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      "❌ Proses dibatalkan.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  /*
+   * TOMBOL MENU UTAMA
+   */
+  if (text === "📚 Catalogue") {
+    await clearSession(env, chat);
+
+    const rows = await catalogueRows(env, owner);
+
+    if (!rows.length) {
+      return send(
+        env,
+        chat,
+        "📚 <b>CATALOGUE</b>\n\nBelum ada catalogue.\n\nTekan <b>➕ Tambah Catalogue</b> untuk membuat catalogue pertama.",
+        { reply_markup: mainKeyboard() }
+      );
+    }
+
+    let msg = "📚 <b>CATALOGUE</b>\n\n";
+
+    rows.forEach((r, i) => {
+      msg +=
+        `<b>${i + 1}. ${escapeHtml(r.name)}</b>\n` +
+        `🔗 ${escapeHtml(r.link)}\n\n`;
+    });
+
+    return send(
+      env,
+      chat,
+      msg.trim(),
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (text === "➕ Tambah Catalogue") {
+    await setSession(env, chat, "CATALOGUE_NAME");
+
+    return send(
+      env,
+      chat,
+      `➕ <b>TAMBAH CATALOGUE</b>\n\n` +
+      `Masukkan <b>nama catalogue</b> terlebih dahulu.\n\n` +
+      `Contoh:\n<code>Catalogue September</code>`
+    );
+  }
+
+  if (text === "🗑️ Hapus Catalogue") {
+    await clearSession(env, chat);
+
+    const rows = await catalogueRows(env, owner);
+
+    if (!rows.length) {
+      return send(
+        env,
+        chat,
+        "🗑️ Belum ada catalogue yang bisa dihapus.",
+        { reply_markup: mainKeyboard() }
+      );
+    }
+
+    const buttons = rows.map((r) => [
+      {
+        text: `🗑️ ${r.name}`,
+        callback_data: `delcat:${r.id}`
+      }
+    ]);
+
+    buttons.push([
+      {
+        text: "❌ Batal",
+        callback_data: "cancel"
+      }
+    ]);
+
+    return send(
+      env,
+      chat,
+      "🗑️ <b>HAPUS CATALOGUE</b>\n\nPilih catalogue yang ingin dihapus:",
+      {
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      }
+    );
+  }
+
+  if (text === "🛒 Order Baru") {
+    await clearSession(env, chat);
+    return startOrder(env, chat, owner);
+  }
+
+  if (text === "📋 Pesanan") {
+    await clearSession(env, chat);
+
+    const rows = await orderRows(env, owner);
+
+    if (!rows.length) {
+      return send(
+        env,
+        chat,
+        "📋 <b>PESANAN</b>\n\nBelum ada pesanan.",
+        { reply_markup: mainKeyboard() }
+      );
+    }
+
+    let msg = "📋 <b>DAFTAR PESANAN</b>\n\n";
+    const buttons = [];
+
+    rows.forEach((r) => {
+      const paid = Number(r.paid || 0);
+      const due = Number(r.amount_due || 0);
+      const piutang = Math.max(due - paid, 0);
+
+      msg +=
+        `<b>#${r.id} — ${escapeHtml(r.username)}</b>\n` +
+        `📚 ${escapeHtml(r.catalogue_name)}\n` +
+        `📅 Order: ${displayDate(r.created_at)}\n` +
+        `⏰ Deadline: ${escapeHtml(r.deadline || "-")}\n` +
+        `💰 Nominal: Rp ${money(due)}\n` +
+        `💵 Masuk: Rp ${money(paid)}\n` +
+        `🧾 Piutang: Rp ${money(piutang)}\n` +
+        `📌 ${orderStatus(r.status, paid, due)}\n\n`;
+
+      buttons.push([
+        {
+          text: `🔎 Order #${r.id} — ${r.username}`,
+          callback_data: `order:${r.id}`
+        }
+      ]);
+    });
+
+    return send(
+      env,
+      chat,
+      msg.trim(),
+      {
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      }
+    );
+  }
+
+  if (text === "📅 Hari Ini") {
+    await clearSession(env, chat);
+    return todayReport(env, chat, owner);
+  }
+
+  if (text === "👥 Buyers") {
+    await clearSession(env, chat);
+    return buyersReport(env, chat, owner);
+  }
+
+  if (text === "💰 Keuangan") {
+    await clearSession(env, chat);
+
+    const income = await env.DB.prepare(`
+      SELECT COALESCE(SUM(p.amount),0) AS total
+      FROM payments p
+      JOIN orders o ON o.id=p.order_id
+      WHERE ${scope(owner, env, "o.owner_id")}
+    `)
+      .bind(owner)
+      .first();
+
+    const expense = await env.DB.prepare(`
+      SELECT COALESCE(SUM(amount),0) AS total
+      FROM expenses
+      WHERE ${scope(owner, env)}
+    `)
+      .bind(owner)
+      .first();
+
+    const piutang = await env.DB.prepare(`
+      SELECT COALESCE(
+        SUM(
+          CASE
+            WHEN o.amount_due - COALESCE(
+              (SELECT SUM(p.amount)
+               FROM payments p
+               WHERE p.order_id=o.id),
+              0
+            ) > 0
+            THEN o.amount_due - COALESCE(
+              (SELECT SUM(p.amount)
+               FROM payments p
+               WHERE p.order_id=o.id),
+              0
+            )
+            ELSE 0
+          END
+        ),
+        0
+      ) AS total
+      FROM orders o
+      WHERE ${scope(owner, env, "o.owner_id")}
+        AND o.status != 'DONE'
+    `)
+      .bind(owner)
+      .first();
+
+    const totalIncome = Number(income?.total || 0);
+    const totalExpense = Number(expense?.total || 0);
+    const totalPiutang = Number(piutang?.total || 0);
+    const profit = totalIncome - totalExpense;
+
+    return send(
+      env,
+      chat,
+      `💰 <b>KEUANGAN</b>\n\n` +
+      `💵 Total Income: <b>Rp ${money(totalIncome)}</b>\n` +
+      `💸 Total Modal: <b>Rp ${money(totalExpense)}</b>\n` +
+      `📈 Profit: <b>Rp ${money(profit)}</b>\n` +
+      `🧾 Piutang: <b>Rp ${money(totalPiutang)}</b>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (text === "💸 Tambah Modal") {
+    await setSession(env, chat, "EXPENSE_DESC");
+
+    return send(
+      env,
+      chat,
+      `💸 <b>TAMBAH MODAL</b>\n\n` +
+      `Masukkan keterangan modal.\n\n` +
+      `Contoh:\n<code>Beli bahan</code>`
+    );
+  }
+
+  if (text === "⏰ Deadline") {
+    await clearSession(env, chat);
+
+    const rows = (
+      await env.DB.prepare(`
+        SELECT
+          o.id,
+          o.deadline,
+          o.status,
+          o.amount_due,
+          b.username,
+          c.name AS catalogue_name
+        FROM orders o
+        JOIN buyers b ON b.id=o.buyer_id
+        JOIN catalogues c ON c.id=o.catalogue_id
+        WHERE ${scope(owner, env, "o.owner_id")}
+          AND o.status != 'DONE'
+          AND o.deadline IS NOT NULL
+        ORDER BY o.deadline
+      `)
+        .bind(owner)
+        .all()
+    ).results || [];
+
+    if (!rows.length) {
+      return send(
+        env,
+        chat,
+        "⏰ <b>DEADLINE</b>\n\nTidak ada order dengan deadline aktif.",
+        { reply_markup: mainKeyboard() }
+      );
+    }
+
+    let msg = "⏰ <b>DEADLINE ORDER</b>\n\n";
+
+    rows.forEach((r) => {
+      msg +=
+        `<b>#${r.id} — ${escapeHtml(r.username)}</b>\n` +
+        `📚 ${escapeHtml(r.catalogue_name)}\n` +
+        `⏰ Deadline: <b>${escapeHtml(r.deadline)}</b>\n` +
+        `💰 Rp ${money(r.amount_due)}\n` +
+        `📌 ${escapeHtml(r.status)}\n\n`;
+    });
+
+    return send(
+      env,
+      chat,
+      msg.trim(),
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (text === "ℹ️ About") {
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      `ℹ️ <b>ABOUT JEJE STORE</b>\n\n` +
+      `JEJE adalah bot pribadi untuk membantu mencatat dan mengelola orderan.\n\n` +
+      `📚 Catalogue\n` +
+      `🛒 Order\n` +
+      `👥 Buyer\n` +
+      `💰 Income\n` +
+      `💸 Modal\n` +
+      `🧾 Piutang\n` +
+      `⏰ Deadline\n\n` +
+      `<i>Credit by @jpesek — @eyshies</i>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  /*
+   * PROSES INPUT BERDASARKAN SESSION
+   */
+  const session = await getSession(env, chat);
+
+  if (!session) {
+    return send(
+      env,
+      chat,
+      "🤔 Aku belum tahu mau melakukan apa.\n\nGunakan menu di bawah ya.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (session.state === "CATALOGUE_NAME") {
+    const name = text.trim();
+
+    if (!name) {
+      return send(env, chat, "❌ Nama catalogue tidak boleh kosong.");
+    }
+
+    await setSession(env, chat, "CATALOGUE_LINK", { name });
+
+    return send(
+      env,
+      chat,
+      `📚 Nama catalogue: <b>${escapeHtml(name)}</b>\n\n` +
+      `Sekarang masukkan <b>link postingan Telegram</b>.\n\n` +
+      `Contoh:\n<code>https://t.me/namachannel/123</code>`
+    );
+  }
+
+  if (session.state === "CATALOGUE_LINK") {
+    const link = text.trim();
+
+    if (!/^https?:\\/\\/\\S+$/i.test(link)) {
+      return send(
+        env,
+        chat,
+        "❌ Link tidak valid.\n\nMasukkan link Telegram yang diawali <code>https://</code>."
+      );
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO catalogues(name,link,owner_id)
+      VALUES(?,?,?)
+    `)
+      .bind(session.data.name, link, owner)
+      .run();
+
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      `✅ <b>Catalogue berhasil ditambahkan!</b>\n\n` +
+      `📚 Nama: <b>${escapeHtml(session.data.name)}</b>\n` +
+      `🔗 ${escapeHtml(link)}`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (session.state === "ORDER_BUYER") {
+    const match = text.match(/^(@[A-Za-z0-9_]+)\s+(.+)$/);
+
+    if (!match) {
+      return send(
+        env,
+        chat,
+        `❌ Format salah.\n\nGunakan:\n<code>@jpesek 5,000</code>`
+      );
+    }
+
+    const username = match[1];
+    const amount = parseMoney(match[2]);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return send(
+        env,
+        chat,
+        "❌ Nominal tidak valid.\n\nContoh: <code>@jpesek 5,000</code>"
+      );
+    }
+
+    return chooseOrderBuyer(
+      env,
+      chat,
+      owner,
+      session.data.catalogueId,
+      username,
+      amount
+    );
+  }
+
+  if (session.state === "ORDER_DEADLINE") {
+    const deadline = text.trim();
+
+    if (!validDate(deadline)) {
+      return send(
+        env,
+        chat,
+        "❌ Format tanggal salah.\n\nGunakan format:\n<code>DD/MM/YYYY</code>"
+      );
+    }
+
+    return createOrder(
+      env,
+      chat,
+      owner,
+      session.data.catalogueId,
+      session.data.buyerId,
+      session.data.username,
+      session.data.amount,
+      deadline
+    );
+  }
+
+  if (session.state === "INCOME_AMOUNT") {
+    const amount = parseMoney(text);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return send(
+        env,
+        chat,
+        "❌ Nominal income tidak valid.\n\nContoh: <code>5,000</code>"
+      );
+    }
+
+    return saveIncome(
+      env,
+      chat,
+      owner,
+      session.data.orderId,
+      amount
+    );
+  }
+
+  if (session.state === "EXPENSE_DESC") {
+    const description = text.trim();
+
+    if (!description) {
+      return send(
+        env,
+        chat,
+        "❌ Keterangan modal tidak boleh kosong."
+      );
+    }
+
+    await setSession(
+      env,
+      chat,
+      "EXPENSE_AMOUNT",
+      { description }
+    );
+
+    return send(
+      env,
+      chat,
+      `💸 Keterangan: <b>${escapeHtml(description)}</b>\n\n` +
+      `Sekarang masukkan nominal modal.\n\n` +
+      `Contoh:\n<code>50,000</code>`
+    );
+  }
+
+  if (session.state === "EXPENSE_AMOUNT") {
+    const amount = parseMoney(text);
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return send(
+        env,
+        chat,
+        "❌ Nominal modal tidak valid.\n\nContoh: <code>50,000</code>"
+      );
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO expenses(description,amount,owner_id)
+      VALUES(?,?,?)
+    `)
+      .bind(session.data.description, amount, owner)
+      .run();
+
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      `✅ <b>Modal berhasil dicatat!</b>\n\n` +
+      `📝 ${escapeHtml(session.data.description)}\n` +
+      `💸 Rp ${money(amount)}`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  await clearSession(env, chat);
+
+  return send(
+    env,
+    chat,
+    "⚠️ Sesi sebelumnya sudah tidak dikenali.\n\nSilakan pilih menu lagi.",
+    { reply_markup: mainKeyboard() }
+  );
+}
+
+
+async function handleCallback(env, update) {
+  const chat = chatId(update);
+  const owner = ownerId(update);
+  const data = String(update?.callback_query?.data || "");
+  const callbackId = update?.callback_query?.id;
+
+  if (!chat || !owner) return;
+
+  if (!isPrivate(update)) {
+    await answerCallback(env, callbackId, "Gunakan JEJE di private chat.");
+    return;
+  }
+
+  await answerCallback(env, callbackId);
+
+  if (data === "cancel") {
+    await clearSession(env, chat);
+
+    return send(
+      env,
+      chat,
+      "❌ Dibatalkan.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (data.startsWith("ordercat:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return chooseOrderCatalogue(
+      env,
+      chat,
+      owner,
+      id
+    );
+  }
+
+  if (data.startsWith("delcat:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return confirmDeleteCatalogue(
+      env,
+      chat,
+      owner,
+      id
+    );
+  }
+
+  if (data.startsWith("confirmdel:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return deleteCatalogue(
+      env,
+      chat,
+      owner,
+      id
+    );
+  }
+
+  if (data.startsWith("order:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return showOrderActions(
+      env,
+      chat,
+      owner,
+      id
+    );
+  }
+
+  if (data.startsWith("income:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return incomePrompt(
+      env,
+      chat,
+      owner,
+      id
+    );
+  }
+
+  if (data.startsWith("done:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return markOrder(
+      env,
+      chat,
+      owner,
+      id,
+      "DONE"
+    );
+  }
+
+  if (data.startsWith("unpaid:")) {
+    const id = Number(data.split(":")[1]);
+
+    if (!Number.isFinite(id)) return;
+
+    return markOrder(
+      env,
+      chat,
+      owner,
+      id,
+      "UNPAID"
+    );
+  }
+
+  return send(
+    env,
+    chat,
+    "⚠️ Tombol tersebut sudah tidak aktif.",
+    { reply_markup: mainKeyboard() }
+  );
+        }
+
 async function setupWebhook(env, request) {
   const url = new URL(request.url);
   const secret = url.searchParams.get("secret");

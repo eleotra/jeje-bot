@@ -1,402 +1,1220 @@
-const MENU = {
-  keyboard: [
-    [{ text: "📚 Catalogue" }, { text: "🛒 Order Baru" }],
-    [{ text: "👤 Buyer" }, { text: "📊 Today" }],
-    [{ text: "💰 Keuangan" }, { text: "📅 Deadline" }],
-  ],
-  resize_keyboard: true,
-  is_persistent: true,
-};
+const TELEGRAM = "https://api.telegram.org";
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json; charset=UTF-8" },
-  });
-}
-
-async function tg(env, method, body = {}) {
-  const r = await fetch(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+async function tg(env, method, body) {
+  const r = await fetch(`${TELEGRAM}/bot${env.BOT_TOKEN}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  return r.json();
+  return await r.json();
 }
 
-async function send(env, chatId, text, extra = {}) {
-  return tg(env, "sendMessage", {
-    chat_id: chatId,
-    text,
-    ...extra,
-  });
-}
+const j = (x) => JSON.stringify(x);
 
-async function answerCallback(env, queryId, text = "") {
-  return tg(env, "answerCallbackQuery", {
-    callback_query_id: queryId,
-    text,
-  });
-}
-
-function ownerOnly(update, env) {
-  const id =
+function ownerId(update) {
+  return String(
     update?.message?.from?.id ??
-    update?.callback_query?.from?.id;
-  return String(id) === String(env.OWNER_ID);
+    update?.callback_query?.from?.id ??
+    ""
+  );
 }
 
-async function getSession(env, chatId) {
-  return env.DB.prepare("SELECT * FROM sessions WHERE chat_id = ?")
-    .bind(String(chatId)).first();
+function chatId(update) {
+  return String(
+    update?.message?.chat?.id ??
+    update?.callback_query?.message?.chat?.id ??
+    ""
+  );
 }
 
-async function setSession(env, chatId, state, data = {}) {
-  await env.DB.prepare(`
-    INSERT INTO sessions(chat_id,state,data_json)
-    VALUES(?,?,?)
-    ON CONFLICT(chat_id) DO UPDATE SET state=excluded.state,data_json=excluded.data_json
-  `).bind(String(chatId), state, JSON.stringify(data)).run();
-}
-
-async function clearSession(env, chatId) {
-  await env.DB.prepare("DELETE FROM sessions WHERE chat_id=?").bind(String(chatId)).run();
-}
-
-async function upsertBuyer(env, username) {
-  const clean = username.trim();
-  await env.DB.prepare(`
-    INSERT INTO buyers(username) VALUES(?)
-    ON CONFLICT(username) DO NOTHING
-  `).bind(clean).run();
-  return env.DB.prepare("SELECT id,username FROM buyers WHERE username=?")
-    .bind(clean).first();
+function isPrivate(update) {
+  return (
+    update?.message?.chat?.type === "private" ||
+    update?.callback_query?.message?.chat?.type === "private"
+  );
 }
 
 function money(n) {
   return new Intl.NumberFormat("id-ID").format(Number(n || 0));
 }
 
-function dateToday() {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Jakarta",
-  }).format(new Date());
-}
-
-function dateTimeNow() {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Jakarta",
-    dateStyle: "short",
-    timeStyle: "medium",
-  }).format(new Date());
+function parseMoney(s) {
+  const digits = String(s || "").replace(/[^\d]/g, "");
+  return digits ? Number(digits) : NaN;
 }
 
 function validDate(s) {
   return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
 }
 
-async function catalogueList(env, chatId, mode = "view") {
-  const rows = await env.DB.prepare(
-    "SELECT id,name,link FROM catalogues ORDER BY id"
-  ).all();
-
-  if (!rows.results.length) {
-    await send(env, chatId, "📚 Catalogue masih kosong.\n\nKetik /addcatalogue untuk menambahkan catalogue.");
-    return;
-  }
-
-  if (mode === "order") {
-    const buttons = rows.results.map(r => [{
-      text: `${r.id}. ${r.name}`,
-      callback_data: `ordercat:${r.id}`,
-    }]);
-    await send(env, chatId, "🛒 Pilih catalogue untuk order baru:", {
-      reply_markup: { inline_keyboard: buttons },
-    });
-    return;
-  }
-
-  let text = "📚 CATALOGUE JEJE\n\n";
-  for (const r of rows.results) {
-    text += `${r.id}. ${r.name}\n${r.link || "-"}\n\n`;
-  }
-  text += "Ketik /addcatalogue untuk tambah catalogue.";
-  await send(env, chatId, text);
+function todayISO() {
+  return new Date(Date.now() + 7 * 60 * 60 * 1000)
+    .toISOString()
+    .slice(0, 10);
 }
 
-async function showOrder(env, chatId, orderId) {
-  const row = await env.DB.prepare(`
-    SELECT o.id,o.status,o.deadline,c.name catalogue,b.username,
-           COALESCE((SELECT SUM(amount) FROM payments p WHERE p.order_id=o.id),0) amount
-    FROM orders o
-    JOIN buyers b ON b.id=o.buyer_id
-    JOIN catalogues c ON c.id=o.catalogue_id
-    WHERE o.id=?
-  `).bind(orderId).first();
+function displayDate(s) {
+  if (!s) return "-";
 
-  if (!row) return send(env, chatId, "Order tidak ditemukan.");
+  const m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})/);
 
-  const statusMap = {
-    PENDING: "⏳ BELUM BAYAR",
-    UNPAID: "⏳ BELUM BAYAR",
-    PAID: "💰 SUDAH BAYAR",
-    DONE: "✅ DONE",
-  };
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : s;
+}
 
-  const text =
-    `🧾 ORDER #${row.id}\n\n` +
-    `👤 Buyer: ${row.username}\n` +
-    `📚 Catalogue: ${row.name}\n` +
-    `📅 Deadline: ${row.deadline || "-"}\n` +
-    `💳 Status: ${statusMap[row.status] || row.status}\n` +
-    `💰 Income: Rp${money(row.amount)}`;
+function scope(owner, env, col = "owner_id") {
+  return owner === String(env.OWNER_ID)
+    ? `(${col} = ? OR ${col} IS NULL)`
+    : `(${col} = ?)`;
+}
 
-  await send(env, chatId, text, {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          { text: "💰 + INCOME", callback_data: `income:${row.id}` },
-          { text: "⏳ Belum Bayar", callback_data: `unpaid:${row.id}` },
-        ],
-        [{ text: "✅ DONE", callback_data: `done:${row.id}` }],
+async function getSession(env, key) {
+  const r = await env.DB
+    .prepare("SELECT state,data_json FROM sessions WHERE chat_id=?")
+    .bind(key)
+    .first();
+
+  if (!r) return null;
+
+  try {
+    return {
+      state: r.state,
+      data: JSON.parse(r.data_json || "{}")
+    };
+  } catch {
+    return {
+      state: r.state,
+      data: {}
+    };
+  }
+}
+
+async function setSession(env, key, state, data = {}) {
+  await env.DB.prepare(`
+    INSERT INTO sessions(chat_id,state,data_json,updated_at)
+    VALUES(?,?,?,datetime('now'))
+    ON CONFLICT(chat_id) DO UPDATE SET
+      state=excluded.state,
+      data_json=excluded.data_json,
+      updated_at=datetime('now')
+  `)
+    .bind(key, state, j(data))
+    .run();
+}
+
+async function clearSession(env, key) {
+  await env.DB
+    .prepare("DELETE FROM sessions WHERE chat_id=?")
+    .bind(key)
+    .run();
+}
+
+function mainKeyboard() {
+  return {
+    keyboard: [
+      [
+        { text: "📚 Catalogue" },
+        { text: "🛒 Order Baru" }
       ],
-    },
+      [
+        { text: "📋 Pesanan" },
+        { text: "📅 Hari Ini" }
+      ],
+      [
+        { text: "👥 Buyers" },
+        { text: "💰 Keuangan" }
+      ],
+      [
+        { text: "⏰ Deadline" },
+        { text: "➕ Tambah Catalogue" }
+      ],
+      [
+        { text: "🗑️ Hapus Catalogue" },
+        { text: "💸 Tambah Modal" }
+      ],
+      [
+        { text: "ℹ️ About" }
+      ]
+    ],
+    resize_keyboard: true
+  };
+}
+
+async function send(env, chat, text, extra = {}) {
+  return tg(env, "sendMessage", {
+    chat_id: chat,
+    text,
+    parse_mode: "HTML",
+    ...extra
   });
 }
 
-async function today(env, chatId) {
-  const day = dateToday();
-  const orders = await env.DB.prepare(`
-    SELECT o.id,o.status,o.deadline,c.name,b.username,
-      COALESCE((SELECT SUM(amount) FROM payments p WHERE p.order_id=o.id),0) amount
-    FROM orders o
-    JOIN buyers b ON b.id=o.buyer_id
-    JOIN catalogues c ON c.id=o.catalogue_id
-    WHERE substr(o.created_at,1,10)=?
-    ORDER BY o.id DESC
-  `).bind(day).all();
-
-  const income = await env.DB.prepare(`
-    SELECT COALESCE(SUM(amount),0) total FROM payments WHERE substr(created_at,1,10)=?
-  `).bind(day).first();
-
-  let text = `📊 TODAY — ${day}\n\n`;
-  if (!orders.results.length) {
-    text += "Belum ada order hari ini.\n";
-  } else {
-    for (const o of orders.results) {
-      const s = o.status === "DONE" ? "✅" : (o.status === "PAID" ? "💰" : "⏳");
-      text += `${s} #${o.id} @${o.username.replace(/^@/, "")} — ${o.name} — Rp${money(o.amount)}\n`;
-    }
-  }
-  text += `\n💵 Income hari ini: Rp${money(income.total)}`;
-  await send(env, chatId, text);
+async function answerCallback(env, id, text = "") {
+  return tg(env, "answerCallbackQuery", {
+    callback_query_id: id,
+    text
+  });
 }
 
-async function finance(env, chatId) {
-  const inc = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) total FROM payments").first();
-  const exp = await env.DB.prepare("SELECT COALESCE(SUM(amount),0) total FROM expenses").first();
-  const unpaid = await env.DB.prepare(`
-    SELECT COALESCE(SUM(x.amount),0) total FROM (
-      SELECT o.id, COALESCE((SELECT SUM(amount) FROM payments p WHERE p.order_id=o.id),0) amount
-      FROM orders o WHERE o.status IN ('PENDING','UNPAID')
-    ) x
-  `).first();
+function escapeHtml(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
 
-  const income = Number(inc.total || 0);
-  const expense = Number(exp.total || 0);
-  const piutang = Number(unpaid.total || 0);
+async function catalogueRows(env, owner) {
+  return (
+    await env.DB.prepare(`
+      SELECT id,name,link,created_at
+      FROM catalogues
+      WHERE ${scope(owner, env)}
+      ORDER BY id
+    `)
+      .bind(owner)
+      .all()
+  ).results || [];
+}
 
-  await send(env, chatId,
-    `💰 KEUANGAN\n\n` +
-    `💵 Total income: Rp${money(income)}\n` +
-    `💸 Total pengeluaran/modal: Rp${money(expense)}\n` +
-    `📈 Profit sederhana: Rp${money(income - expense)}\n` +
-    `📌 Piutang tercatat: Rp${money(piutang)}\n\n` +
-    `Untuk tambah pengeluaran: /modal`
+async function confirmDeleteCatalogue(env, chat, owner, id) {
+  const row = await env.DB.prepare(`
+    SELECT id,name
+    FROM catalogues
+    WHERE id=? AND ${scope(owner, env)}
+  `)
+    .bind(id, owner)
+    .first();
+
+  if (!row) {
+    return send(env, chat, "❌ Catalogue tidak ditemukan.");
+  }
+
+  return send(
+    env,
+    chat,
+    `⚠️ Yakin mau menghapus catalogue <b>${escapeHtml(row.name)}</b>?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Ya, Hapus",
+              callback_data: `confirmdel:${row.id}`
+            },
+            {
+              text: "❌ Batal",
+              callback_data: "cancel"
+            }
+          ]
+        ]
+      }
+    }
   );
 }
 
-async function buyers(env, chatId) {
-  const rows = await env.DB.prepare(`
-    SELECT b.username, COUNT(o.id) orders,
-      COALESCE(SUM((SELECT SUM(amount) FROM payments p WHERE p.order_id=o.id)),0) total
-    FROM buyers b
-    LEFT JOIN orders o ON o.buyer_id=b.id
-    GROUP BY b.id
-    ORDER BY b.id DESC
-  `).all();
+async function deleteCatalogue(env, chat, owner, id) {
+  const row = await env.DB.prepare(`
+    SELECT id,name
+    FROM catalogues
+    WHERE id=? AND ${scope(owner, env)}
+  `)
+    .bind(id, owner)
+    .first();
 
-  if (!rows.results.length) return send(env, chatId, "👤 Belum ada buyer.");
-  let text = "👤 BUYER\n\n";
-  for (const r of rows.results) {
-    text += `${r.username} — ${r.orders} order — Rp${money(r.total)}\n`;
+  if (!row) {
+    return send(env, chat, "❌ Catalogue tidak ditemukan.");
   }
-  await send(env, chatId, text);
+
+  const used = await env.DB.prepare(`
+    SELECT COUNT(*) AS total
+    FROM orders
+    WHERE catalogue_id=?
+  `)
+    .bind(id)
+    .first();
+
+  if (Number(used?.total || 0) > 0) {
+    return send(
+      env,
+      chat,
+      `⚠️ Catalogue <b>${escapeHtml(row.name)}</b> tidak bisa dihapus karena sudah digunakan pada pesanan.\n\nData lama tetap aman.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  await env.DB.prepare(`
+    DELETE FROM catalogues
+    WHERE id=? AND ${scope(owner, env)}
+  `)
+    .bind(id, owner)
+    .run();
+
+  return send(
+    env,
+    chat,
+    `✅ Catalogue <b>${escapeHtml(row.name)}</b> berhasil dihapus.`,
+    { reply_markup: mainKeyboard() }
+  );
 }
 
-async function deadlines(env, chatId) {
-  const rows = await env.DB.prepare(`
-    SELECT o.id,o.deadline,o.status,b.username,c.name
+async function startOrder(env, chat, owner) {
+  const rows = await catalogueRows(env, owner);
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      "🛒 Belum ada catalogue.\n\nTambahkan catalogue terlebih dahulu.",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  const buttons = rows.map((r) => [
+    {
+      text: `📚 ${r.name}`,
+      callback_data: `ordercat:${r.id}`
+    }
+  ]);
+
+  buttons.push([
+    {
+      text: "❌ Batal",
+      callback_data: "cancel"
+    }
+  ]);
+
+  return send(
+    env,
+    chat,
+    "🛒 <b>ORDER BARU</b>\n\nPilih catalogue yang dibeli:",
+    {
+      reply_markup: {
+        inline_keyboard: buttons
+      }
+    }
+  );
+}
+
+async function chooseOrderCatalogue(env, chat, owner, catalogueId) {
+  const row = await env.DB.prepare(`
+    SELECT id,name,link
+    FROM catalogues
+    WHERE id=? AND ${scope(owner, env)}
+  `)
+    .bind(catalogueId, owner)
+    .first();
+
+  if (!row) {
+    return send(env, chat, "❌ Catalogue tidak ditemukan.");
+  }
+
+  await setSession(env, chat, "ORDER_BUYER", {
+    catalogueId: row.id,
+    catalogueName: row.name
+  });
+
+  return send(
+    env,
+    chat,
+    `📚 Catalogue: <b>${escapeHtml(row.name)}</b>\n\n` +
+    `Sekarang masukkan <b>username buyer + nominal</b>.\n\n` +
+    `Contoh:\n<code>@jpesek 5,000</code>\n\n` +
+    `Tanpa tanda <code>|</code> ya.`
+  );
+}
+
+async function saveBuyer(env, owner, username) {
+  const existing = await env.DB.prepare(`
+    SELECT id,username
+    FROM buyers
+    WHERE username=? AND ${scope(owner, env)}
+    LIMIT 1
+  `)
+    .bind(username, owner)
+    .first();
+
+  if (existing) {
+    return existing;
+  }
+
+  try {
+    const result = await env.DB.prepare(`
+      INSERT INTO buyers(username,owner_id)
+      VALUES(?,?)
+    `)
+      .bind(username, owner)
+      .run();
+
+    return {
+      id: result.meta.last_row_id,
+      username
+    };
+  } catch (e) {
+    // Database lama memiliki UNIQUE(username).
+    // Kalau username sudah digunakan owner lain,
+    // jangan pernah memakai data owner lain.
+    return null;
+  }
+}
+
+async function chooseOrderBuyer(
+  env,
+  chat,
+  owner,
+  catalogueId,
+  username,
+  amount
+) {
+  const buyer = await saveBuyer(env, owner, username);
+
+  if (!buyer) {
+    return send(
+      env,
+      chat,
+      `❌ Username <b>${escapeHtml(username)}</b> sudah digunakan pada workspace lain.\n\n` +
+      `Gunakan username buyer lain untuk sementara.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  await setSession(env, chat, "ORDER_DEADLINE", {
+    catalogueId,
+    buyerId: buyer.id,
+    username,
+    amount
+  });
+
+  return send(
+    env,
+    chat,
+    `👤 Buyer: <b>${escapeHtml(username)}</b>\n` +
+    `💰 Nominal: <b>Rp ${money(amount)}</b>\n\n` +
+    `Sekarang masukkan <b>deadline</b>.\n\n` +
+    `Format: <code>DD/MM/YYYY</code>\n` +
+    `Contoh: <code>25/09/2026</code>`
+  );
+}
+
+async function createOrder(
+  env,
+  chat,
+  owner,
+  catalogueId,
+  buyerId,
+  username,
+  amount,
+  deadline
+) {
+  await env.DB.prepare(`
+    INSERT INTO orders(
+      buyer_id,
+      catalogue_id,
+      status,
+      deadline,
+      amount_due,
+      owner_id
+    )
+    VALUES(?,?,?,?,?,?)
+  `)
+    .bind(
+      buyerId,
+      catalogueId,
+      "PENDING",
+      deadline,
+      amount,
+      owner
+    )
+    .run();
+
+  await clearSession(env, chat);
+
+  return send(
+    env,
+    chat,
+    `✅ <b>Order berhasil dicatat!</b>\n\n` +
+    `👤 Buyer: <b>${escapeHtml(username)}</b>\n` +
+    `📚 Catalogue: <b>${escapeHtml(
+      (await env.DB.prepare(
+        "SELECT name FROM catalogues WHERE id=?"
+      ).bind(catalogueId).first())?.name || "-"
+    )}</b>\n` +
+    `📅 Order: <b>${displayDate(todayISO())}</b>\n` +
+    `⏰ Deadline: <b>${escapeHtml(deadline)}</b>\n` +
+    `💰 Nominal: <b>Rp ${money(amount)}</b>\n` +
+    `📌 Status: <b>PENDING</b>`,
+    {
+      reply_markup: mainKeyboard()
+    }
+  );
+}
+
+async function orderRows(env, owner) {
+  return (
+    await env.DB.prepare(`
+      SELECT
+        o.id,
+        o.status,
+        o.deadline,
+        o.amount_due,
+        o.created_at,
+        b.username,
+        c.name AS catalogue_name,
+        COALESCE(
+          (SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.order_id=o.id),
+          0
+        ) AS paid
+      FROM orders o
+      JOIN buyers b ON b.id=o.buyer_id
+      JOIN catalogues c ON c.id=o.catalogue_id
+      WHERE ${scope(owner, env, "o.owner_id")}
+      ORDER BY o.id DESC
+    `)
+      .bind(owner)
+      .all()
+  ).results || [];
+}
+
+function orderStatus(status, paid, due) {
+  const totalPaid = Number(paid || 0);
+  const totalDue = Number(due || 0);
+
+  if (status === "DONE") return "✅ DONE";
+  if (totalPaid >= totalDue && totalDue > 0) return "💰 PAID";
+  if (status === "UNPAID") return "❌ UNPAID";
+  if (totalPaid > 0) return "🟡 PARTIAL";
+  return "⏳ PENDING";
+}
+
+async function showOrders(env, chat, owner) {
+  const rows = await orderRows(env, owner);
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      "📋 <b>Belum ada pesanan.</b>",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  let text = "📋 <b>DAFTAR PESANAN</b>\n\n";
+
+  rows.forEach((r) => {
+    const paid = Number(r.paid || 0);
+    const due = Number(r.amount_due || 0);
+    const piutang = Math.max(due - paid, 0);
+
+    text +=
+      `<b>#${r.id} — ${escapeHtml(r.username)}</b>\n` +
+      `📚 ${escapeHtml(r.catalogue_name)}\n` +
+      `📅 Order: ${displayDate(r.created_at)}\n` +
+      `⏰ Deadline: ${escapeHtml(r.deadline || "-")}\n` +
+      `💰 Nominal: Rp ${money(due)}\n` +
+      `💵 Masuk: Rp ${money(paid)}\n` +
+      `🧾 Piutang: Rp ${money(piutang)}\n` +
+      `📌 ${orderStatus(r.status, paid, due)}\n\n`;
+  });
+
+  return send(env, chat, text.trim(), {
+    reply_markup: mainKeyboard()
+  });
+      }
+async function markOrder(env, chat, owner, orderId, action) {
+  const order = await env.DB.prepare(`
+    SELECT
+      o.id,
+      o.status,
+      o.amount_due,
+      b.username
+    FROM orders o
+    JOIN buyers b ON b.id=o.buyer_id
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
+  }
+
+  if (action === "DONE") {
+    await env.DB.prepare(`
+      UPDATE orders
+      SET status='DONE'
+      WHERE id=? AND ${scope(owner, env, "owner_id")}
+    `)
+      .bind(orderId, owner)
+      .run();
+
+    return send(
+      env,
+      chat,
+      `✅ Order <b>#${order.id}</b> milik <b>${escapeHtml(order.username)}</b> ditandai <b>DONE</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  if (action === "UNPAID") {
+    await env.DB.prepare(`
+      UPDATE orders
+      SET status='UNPAID'
+      WHERE id=? AND ${scope(owner, env, "owner_id")}
+    `)
+      .bind(orderId, owner)
+      .run();
+
+    return send(
+      env,
+      chat,
+      `❌ Order <b>#${order.id}</b> milik <b>${escapeHtml(order.username)}</b> ditandai <b>UNPAID</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  return send(env, chat, "❌ Aksi tidak dikenal.");
+}
+
+async function showOrderActions(env, chat, owner, orderId) {
+  const order = await env.DB.prepare(`
+    SELECT
+      o.id,
+      o.status,
+      o.amount_due,
+      o.deadline,
+      o.created_at,
+      b.username,
+      c.name AS catalogue_name,
+      COALESCE(
+        (SELECT SUM(p.amount)
+         FROM payments p
+         WHERE p.order_id=o.id),
+        0
+      ) AS paid
     FROM orders o
     JOIN buyers b ON b.id=o.buyer_id
     JOIN catalogues c ON c.id=o.catalogue_id
-    WHERE o.deadline IS NOT NULL AND o.status <> 'DONE'
-    ORDER BY o.deadline ASC
-  `).all();
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
 
-  if (!rows.results.length) return send(env, chatId, "📅 Tidak ada deadline aktif.");
-  let text = "📅 DEADLINE AKTIF\n\n";
-  for (const r of rows.results) {
-    text += `#${r.id} — ${r.deadline}\n@${r.username.replace(/^@/,"")} — ${r.name}\n\n`;
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
   }
-  await send(env, chatId, text);
+
+  const paid = Number(order.paid || 0);
+  const due = Number(order.amount_due || 0);
+
+  return send(
+    env,
+    chat,
+    `<b>ORDER #${order.id}</b>\n\n` +
+    `👤 ${escapeHtml(order.username)}\n` +
+    `📚 ${escapeHtml(order.catalogue_name)}\n` +
+    `📅 Order: ${displayDate(order.created_at)}\n` +
+    `⏰ Deadline: ${escapeHtml(order.deadline || "-")}\n` +
+    `💰 Nominal: Rp ${money(due)}\n` +
+    `💵 Masuk: Rp ${money(paid)}\n` +
+    `📌 ${orderStatus(order.status, paid, due)}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "➕ INCOME",
+              callback_data: `income:${order.id}`
+            },
+            {
+              text: "❌ UNPAID",
+              callback_data: `unpaid:${order.id}`
+            }
+          ],
+          [
+            {
+              text: "✅ DONE",
+              callback_data: `done:${order.id}`
+            }
+          ]
+        ]
+      }
+    }
+  );
 }
 
-async function handleMessage(update, env) {
-  const msg = update.message;
-  if (!msg?.chat?.id || !msg.text) return;
-  const chatId = msg.chat.id;
-  const text = msg.text.trim();
+async function incomePrompt(env, chat, owner, orderId) {
+  const order = await env.DB.prepare(`
+    SELECT o.id,o.amount_due,b.username
+    FROM orders o
+    JOIN buyers b ON b.id=o.buyer_id
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
 
-  if (String(msg.from?.id) !== String(env.OWNER_ID)) {
-    await send(env, chatId, "⛔ JEJE adalah bot pribadi.");
-    return;
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
   }
 
-  if (text === "/start") {
-    await send(env, chatId, `JEJE STORE siap. 🫶\n${dateTimeNow()}`, { reply_markup: MENU });
-    return;
-  }
+  await setSession(env, chat, "INCOME_AMOUNT", {
+    orderId: order.id
+  });
 
-  const session = await getSession(env, chatId);
-  const stateData = session ? JSON.parse(session.data_json || "{}") : {};
-
-  if (text === "/addcatalogue") {
-    await setSession(env, chatId, "catalogue_add");
-    await send(env, chatId, "📚 Kirim format:\nNama Catalogue | Link Telegram\n\nContoh:\nLove Letter | https://t.me/channel/123");
-    return;
-  }
-
-  if (text === "/modal") {
-    await setSession(env, chatId, "expense_add");
-    await send(env, chatId, "💸 Kirim format:\nKeterangan | Nominal\n\nContoh:\nIklan | 50000");
-    return;
-  }
-
-  if (stateData && session?.state === "catalogue_add") {
-    const [name, link] = text.split("|").map(s => s?.trim());
-    if (!name || !link) {
-      await send(env, chatId, "Format salah. Pakai:\nNama Catalogue | Link Telegram");
-      return;
-    }
-    await env.DB.prepare("INSERT INTO catalogues(name,link) VALUES(?,?)").bind(name, link).run();
-    await clearSession(env, chatId);
-    await send(env, chatId, "✅ Catalogue berhasil disimpan.");
-    return;
-  }
-
-  if (session?.state === "expense_add") {
-    const [description, amountText] = text.split("|").map(s => s?.trim());
-    const amount = Number((amountText || "").replace(/[^\d]/g, ""));
-    if (!description || !amount) {
-      await send(env, chatId, "Format salah. Contoh:\nIklan | 50000");
-      return;
-    }
-    await env.DB.prepare("INSERT INTO expenses(description,amount) VALUES(?,?)")
-      .bind(description, amount).run();
-    await clearSession(env, chatId);
-    await send(env, chatId, `✅ Pengeluaran tersimpan: ${description} — Rp${money(amount)}`);
-    return;
-  }
-
-  if (session?.state === "order_buyer") {
-    const [username, deadline] = text.split("|").map(s => s?.trim());
-    if (!username || !username.startsWith("@") || !deadline || !validDate(deadline)) {
-      await send(env, chatId, "Format salah.\nPakai: @username | DD/MM/YYYY");
-      return;
-    }
-    const buyer = await upsertBuyer(env, username);
-    const order = await env.DB.prepare(`
-      INSERT INTO orders(buyer_id,catalogue_id,status,deadline)
-      VALUES(?,?, 'PENDING',?)
-      RETURNING id
-    `).bind(buyer.id, stateData.catalogue_id, deadline).first();
-    await clearSession(env, chatId);
-    await send(env, chatId, "✅ Order dibuat.");
-    await showOrder(env, chatId, order.id);
-    return;
-  }
-
-  if (session?.state === "income_add") {
-    const amount = Number(text.replace(/[^\d]/g, ""));
-    if (!amount) {
-      await send(env, chatId, "Kirim nominal angka saja. Contoh: 150000");
-      return;
-    }
-    await env.DB.prepare("INSERT INTO payments(order_id,amount) VALUES(?,?)")
-      .bind(stateData.order_id, amount).run();
-    await env.DB.prepare("UPDATE orders SET status='PAID' WHERE id=?")
-      .bind(stateData.order_id).run();
-    await clearSession(env, chatId);
-    await send(env, chatId, `💰 Income Rp${money(amount)} tercatat.`);
-    await showOrder(env, chatId, stateData.order_id);
-    return;
-  }
-
-  if (text === "📚 Catalogue") return catalogueList(env, chatId);
-  if (text === "🛒 Order Baru") return catalogueList(env, chatId, "order");
-  if (text === "👤 Buyer") return buyers(env, chatId);
-  if (text === "📊 Today") return today(env, chatId);
-  if (text === "💰 Keuangan") return finance(env, chatId);
-  if (text === "📅 Deadline") return deadlines(env, chatId);
-
-  await send(env, chatId, "Pilih menu JEJE di bawah ya. 👇", { reply_markup: MENU });
+  return send(
+    env,
+    chat,
+    `➕ <b>INCOME</b>\n\n` +
+    `Order: <b>#${order.id}</b>\n` +
+    `Buyer: <b>${escapeHtml(order.username)}</b>\n` +
+    `Nominal order: <b>Rp ${money(order.amount_due)}</b>\n\n` +
+    `Masukkan nominal uang yang benar-benar masuk.\n\n` +
+    `Contoh: <code>5,000</code>`
+  );
 }
 
-async function handleCallback(update, env) {
-  const q = update.callback_query;
-  const chatId = q?.message?.chat?.id;
-  if (!q || !chatId) return;
-  if (!ownerOnly(update, env)) {
-    await answerCallback(env, q.id, "Akses ditolak.");
-    return;
+async function saveIncome(env, chat, owner, orderId, amount) {
+  const order = await env.DB.prepare(`
+    SELECT id,amount_due
+    FROM orders
+    WHERE id=? AND ${scope(owner, env, "owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
   }
 
-  const [action, rawId] = q.data.split(":");
-  const id = Number(rawId);
+  await env.DB.prepare(`
+    INSERT INTO payments(order_id,amount)
+    VALUES(?,?)
+  `)
+    .bind(orderId, amount)
+    .run();
 
-  if (action === "ordercat") {
-    const c = await env.DB.prepare("SELECT id,name FROM catalogues WHERE id=?").bind(id).first();
-    if (!c) return answerCallback(env, q.id, "Catalogue tidak ditemukan.");
-    await setSession(env, chatId, "order_buyer", { catalogue_id: c.id });
-    await answerCallback(env, q.id);
-    await send(env, chatId, `🛒 Catalogue: ${c.name}\n\nKirim:\n@username | DD/MM/YYYY`);
-    return;
+  const paid = await env.DB.prepare(`
+    SELECT COALESCE(SUM(amount),0) AS total
+    FROM payments
+    WHERE order_id=?
+  `)
+    .bind(orderId)
+    .first();
+
+  const totalPaid = Number(paid?.total || 0);
+  const totalDue = Number(order.amount_due || 0);
+
+  const newStatus =
+    totalPaid >= totalDue && totalDue > 0
+      ? "PAID"
+      : "PENDING";
+
+  await env.DB.prepare(`
+    UPDATE orders
+    SET status=?
+    WHERE id=? AND ${scope(owner, env, "owner_id")}
+  `)
+    .bind(newStatus, orderId, owner)
+    .run();
+
+  await clearSession(env, chat);
+
+  return send(
+    env,
+    chat,
+    `✅ <b>Income berhasil dicatat!</b>\n\n` +
+    `💰 Masuk: <b>Rp ${money(amount)}</b>\n` +
+    `💵 Total masuk order: <b>Rp ${money(totalPaid)}</b>\n` +
+    `🧾 Sisa piutang: <b>Rp ${money(
+      Math.max(totalDue - totalPaid, 0)
+    )}</b>\n` +
+    `📌 Status: <b>${newStatus}</b>`,
+    {
+      reply_markup: mainKeyboard()
+    }
+  );
+}
+
+async function todayReport(env, chat, owner) {
+  const date = todayISO();
+
+  const rows = (
+    await env.DB.prepare(`
+      SELECT
+        o.id,
+        o.status,
+        o.deadline,
+        o.amount_due,
+        o.created_at,
+        b.username,
+        c.name AS catalogue_name,
+        COALESCE(
+          (SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.order_id=o.id),
+          0
+        ) AS paid
+      FROM orders o
+      JOIN buyers b ON b.id=o.buyer_id
+      JOIN catalogues c ON c.id=o.catalogue_id
+      WHERE substr(o.created_at,1,10)=?
+        AND ${scope(owner, env, "o.owner_id")}
+      ORDER BY o.id DESC
+    `)
+      .bind(date, owner)
+      .all()
+  ).results || [];
+
+  const income = (
+    await env.DB.prepare(`
+      SELECT COALESCE(SUM(p.amount),0) AS total
+      FROM payments p
+      JOIN orders o ON o.id=p.order_id
+      WHERE substr(p.created_at,1,10)=?
+        AND ${scope(owner, env, "o.owner_id")}
+    `)
+      .bind(date, owner)
+      .first()
+  )?.total || 0;
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      `📅 <b>REKAP HARI INI</b>\n\n` +
+      `Tanggal: <b>${displayDate(date)}</b>\n\n` +
+      `Belum ada order hari ini.\n\n` +
+      `💰 Income hari ini: <b>Rp ${money(income)}</b>`,
+      { reply_markup: mainKeyboard() }
+    );
   }
 
-  if (action === "income") {
-    await setSession(env, chatId, "income_add", { order_id: id });
-    await answerCallback(env, q.id);
-    await send(env, chatId, "💰 Kirim nominal income. Contoh: 150000");
-    return;
+  let text =
+    `📅 <b>REKAP HARI INI</b>\n` +
+    `Tanggal: <b>${displayDate(date)}</b>\n\n`;
+
+  rows.forEach((r) => {
+    text +=
+      `<b>#${r.id} — ${escapeHtml(r.username)}</b>\n` +
+      `📚 ${escapeHtml(r.catalogue_name)}\n` +
+      `⏰ ${escapeHtml(r.deadline || "-")}\n` +
+      `💰 Rp ${money(r.amount_due)}\n` +
+      `📌 ${orderStatus(r.status, r.paid, r.amount_due)}\n\n`;
+  });
+
+  text += `💵 <b>Total income hari ini: Rp ${money(income)}</b>`;
+
+  return send(env, chat, text, {
+    reply_markup: mainKeyboard()
+  });
+}
+
+async function buyersReport(env, chat, owner) {
+  const rows = (
+    await env.DB.prepare(`
+      SELECT
+        b.id,
+        b.username,
+        COUNT(o.id) AS total_orders,
+        COALESCE(SUM(o.amount_due),0) AS total_nominal
+      FROM buyers b
+      LEFT JOIN orders o ON o.buyer_id=b.id
+        AND ${scope(owner, env, "o.owner_id")}
+      WHERE ${scope(owner, env, "b.owner_id")}
+      GROUP BY b.id,b.username
+      ORDER BY b.id DESC
+    `)
+      .bind(owner, owner)
+      .all()
+  ).results || [];
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      "👥 <b>Belum ada buyer.</b>",
+      { reply_markup: mainKeyboard() }
+    );
   }
 
-  if (action === "unpaid") {
-    await env.DB.prepare("UPDATE orders SET status='UNPAID' WHERE id=?").bind(id).run();
-    await answerCallback(env, q.id, "Ditandai belum bayar.");
-    await showOrder(env, chatId, id);
-    return;
+  let text = "👥 <b>BUYERS</b>\n\n";
+
+  rows.forEach((r, i) => {
+    text +=
+      `<b>${i + 1}. ${escapeHtml(r.username)}</b>\n` +
+      `🛒 Order: ${r.total_orders}\n` +
+      `💰 Total nominal: Rp ${money(r.total_nominal)}\n\n`;
+  });
+
+  return send(env, chat, text.trim(), {
+    reply_markup: mainKeyboard()
+  });
+}
+async function markOrder(env, chat, owner, orderId, action) {
+  const order = await env.DB.prepare(`
+    SELECT
+      o.id,
+      o.status,
+      o.amount_due,
+      b.username
+    FROM orders o
+    JOIN buyers b ON b.id=o.buyer_id
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
   }
 
-  if (action === "done") {
-    await env.DB.prepare("UPDATE orders SET status='DONE' WHERE id=?").bind(id).run();
-    await answerCallback(env, q.id, "Order selesai.");
-    await showOrder(env, chatId, id);
-    return;
+  if (action === "DONE") {
+    await env.DB.prepare(`
+      UPDATE orders
+      SET status='DONE'
+      WHERE id=? AND ${scope(owner, env, "owner_id")}
+    `)
+      .bind(orderId, owner)
+      .run();
+
+    return send(
+      env,
+      chat,
+      `✅ Order <b>#${order.id}</b> milik <b>${escapeHtml(order.username)}</b> ditandai <b>DONE</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
   }
 
-  await answerCallback(env, q.id);
+  if (action === "UNPAID") {
+    await env.DB.prepare(`
+      UPDATE orders
+      SET status='UNPAID'
+      WHERE id=? AND ${scope(owner, env, "owner_id")}
+    `)
+      .bind(orderId, owner)
+      .run();
+
+    return send(
+      env,
+      chat,
+      `❌ Order <b>#${order.id}</b> milik <b>${escapeHtml(order.username)}</b> ditandai <b>UNPAID</b>.`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  return send(env, chat, "❌ Aksi tidak dikenal.");
+}
+
+async function showOrderActions(env, chat, owner, orderId) {
+  const order = await env.DB.prepare(`
+    SELECT
+      o.id,
+      o.status,
+      o.amount_due,
+      o.deadline,
+      o.created_at,
+      b.username,
+      c.name AS catalogue_name,
+      COALESCE(
+        (SELECT SUM(p.amount)
+         FROM payments p
+         WHERE p.order_id=o.id),
+        0
+      ) AS paid
+    FROM orders o
+    JOIN buyers b ON b.id=o.buyer_id
+    JOIN catalogues c ON c.id=o.catalogue_id
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
+  }
+
+  const paid = Number(order.paid || 0);
+  const due = Number(order.amount_due || 0);
+
+  return send(
+    env,
+    chat,
+    `<b>ORDER #${order.id}</b>\n\n` +
+    `👤 ${escapeHtml(order.username)}\n` +
+    `📚 ${escapeHtml(order.catalogue_name)}\n` +
+    `📅 Order: ${displayDate(order.created_at)}\n` +
+    `⏰ Deadline: ${escapeHtml(order.deadline || "-")}\n` +
+    `💰 Nominal: Rp ${money(due)}\n` +
+    `💵 Masuk: Rp ${money(paid)}\n` +
+    `📌 ${orderStatus(order.status, paid, due)}`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "➕ INCOME",
+              callback_data: `income:${order.id}`
+            },
+            {
+              text: "❌ UNPAID",
+              callback_data: `unpaid:${order.id}`
+            }
+          ],
+          [
+            {
+              text: "✅ DONE",
+              callback_data: `done:${order.id}`
+            }
+          ]
+        ]
+      }
+    }
+  );
+}
+
+async function incomePrompt(env, chat, owner, orderId) {
+  const order = await env.DB.prepare(`
+    SELECT o.id,o.amount_due,b.username
+    FROM orders o
+    JOIN buyers b ON b.id=o.buyer_id
+    WHERE o.id=? AND ${scope(owner, env, "o.owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
+  }
+
+  await setSession(env, chat, "INCOME_AMOUNT", {
+    orderId: order.id
+  });
+
+  return send(
+    env,
+    chat,
+    `➕ <b>INCOME</b>\n\n` +
+    `Order: <b>#${order.id}</b>\n` +
+    `Buyer: <b>${escapeHtml(order.username)}</b>\n` +
+    `Nominal order: <b>Rp ${money(order.amount_due)}</b>\n\n` +
+    `Masukkan nominal uang yang benar-benar masuk.\n\n` +
+    `Contoh: <code>5,000</code>`
+  );
+}
+
+async function saveIncome(env, chat, owner, orderId, amount) {
+  const order = await env.DB.prepare(`
+    SELECT id,amount_due
+    FROM orders
+    WHERE id=? AND ${scope(owner, env, "owner_id")}
+  `)
+    .bind(orderId, owner)
+    .first();
+
+  if (!order) {
+    return send(env, chat, "❌ Pesanan tidak ditemukan.");
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO payments(order_id,amount)
+    VALUES(?,?)
+  `)
+    .bind(orderId, amount)
+    .run();
+
+  const paid = await env.DB.prepare(`
+    SELECT COALESCE(SUM(amount),0) AS total
+    FROM payments
+    WHERE order_id=?
+  `)
+    .bind(orderId)
+    .first();
+
+  const totalPaid = Number(paid?.total || 0);
+  const totalDue = Number(order.amount_due || 0);
+
+  const newStatus =
+    totalPaid >= totalDue && totalDue > 0
+      ? "PAID"
+      : "PENDING";
+
+  await env.DB.prepare(`
+    UPDATE orders
+    SET status=?
+    WHERE id=? AND ${scope(owner, env, "owner_id")}
+  `)
+    .bind(newStatus, orderId, owner)
+    .run();
+
+  await clearSession(env, chat);
+
+  return send(
+    env,
+    chat,
+    `✅ <b>Income berhasil dicatat!</b>\n\n` +
+    `💰 Masuk: <b>Rp ${money(amount)}</b>\n` +
+    `💵 Total masuk order: <b>Rp ${money(totalPaid)}</b>\n` +
+    `🧾 Sisa piutang: <b>Rp ${money(
+      Math.max(totalDue - totalPaid, 0)
+    )}</b>\n` +
+    `📌 Status: <b>${newStatus}</b>`,
+    {
+      reply_markup: mainKeyboard()
+    }
+  );
+}
+
+async function todayReport(env, chat, owner) {
+  const date = todayISO();
+
+  const rows = (
+    await env.DB.prepare(`
+      SELECT
+        o.id,
+        o.status,
+        o.deadline,
+        o.amount_due,
+        o.created_at,
+        b.username,
+        c.name AS catalogue_name,
+        COALESCE(
+          (SELECT SUM(p.amount)
+           FROM payments p
+           WHERE p.order_id=o.id),
+          0
+        ) AS paid
+      FROM orders o
+      JOIN buyers b ON b.id=o.buyer_id
+      JOIN catalogues c ON c.id=o.catalogue_id
+      WHERE substr(o.created_at,1,10)=?
+        AND ${scope(owner, env, "o.owner_id")}
+      ORDER BY o.id DESC
+    `)
+      .bind(date, owner)
+      .all()
+  ).results || [];
+
+  const income = (
+    await env.DB.prepare(`
+      SELECT COALESCE(SUM(p.amount),0) AS total
+      FROM payments p
+      JOIN orders o ON o.id=p.order_id
+      WHERE substr(p.created_at,1,10)=?
+        AND ${scope(owner, env, "o.owner_id")}
+    `)
+      .bind(date, owner)
+      .first()
+  )?.total || 0;
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      `📅 <b>REKAP HARI INI</b>\n\n` +
+      `Tanggal: <b>${displayDate(date)}</b>\n\n` +
+      `Belum ada order hari ini.\n\n` +
+      `💰 Income hari ini: <b>Rp ${money(income)}</b>`,
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  let text =
+    `📅 <b>REKAP HARI INI</b>\n` +
+    `Tanggal: <b>${displayDate(date)}</b>\n\n`;
+
+  rows.forEach((r) => {
+    text +=
+      `<b>#${r.id} — ${escapeHtml(r.username)}</b>\n` +
+      `📚 ${escapeHtml(r.catalogue_name)}\n` +
+      `⏰ ${escapeHtml(r.deadline || "-")}\n` +
+      `💰 Rp ${money(r.amount_due)}\n` +
+      `📌 ${orderStatus(r.status, r.paid, r.amount_due)}\n\n`;
+  });
+
+  text += `💵 <b>Total income hari ini: Rp ${money(income)}</b>`;
+
+  return send(env, chat, text, {
+    reply_markup: mainKeyboard()
+  });
+}
+
+async function buyersReport(env, chat, owner) {
+  const rows = (
+    await env.DB.prepare(`
+      SELECT
+        b.id,
+        b.username,
+        COUNT(o.id) AS total_orders,
+        COALESCE(SUM(o.amount_due),0) AS total_nominal
+      FROM buyers b
+      LEFT JOIN orders o ON o.buyer_id=b.id
+        AND ${scope(owner, env, "o.owner_id")}
+      WHERE ${scope(owner, env, "b.owner_id")}
+      GROUP BY b.id,b.username
+      ORDER BY b.id DESC
+    `)
+      .bind(owner, owner)
+      .all()
+  ).results || [];
+
+  if (!rows.length) {
+    return send(
+      env,
+      chat,
+      "👥 <b>Belum ada buyer.</b>",
+      { reply_markup: mainKeyboard() }
+    );
+  }
+
+  let text = "👥 <b>BUYERS</b>\n\n";
+
+  rows.forEach((r, i) => {
+    text +=
+      `<b>${i + 1}. ${escapeHtml(r.username)}</b>\n` +
+      `🛒 Order: ${r.total_orders}\n` +
+      `💰 Total nominal: Rp ${money(r.total_nominal)}\n\n`;
+  });
+
+  return send(env, chat, text.trim(), {
+    reply_markup: mainKeyboard()
+  });
+    }
+async function setupWebhook(env, request) {
+  const url = new URL(request.url);
+  const secret = url.searchParams.get("secret");
+
+  if (!secret || secret !== env.SETUP_SECRET) {
+    return new Response(
+      JSON.stringify({
+        ok: false,
+        error: "Unauthorized"
+      }),
+      {
+        status: 401,
+        headers: {
+          "content-type": "application/json"
+        }
+      }
+    );
+  }
+
+  const webhookUrl = `${url.origin}/webhook`;
+
+  const result = await tg(env, "setWebhook", {
+    url: webhookUrl,
+    allowed_updates: [
+      "message",
+      "callback_query"
+    ]
+  });
+
+  return new Response(
+    JSON.stringify(result),
+    {
+      headers: {
+        "content-type": "application/json"
+      }
+    }
+  );
 }
 
 export default {
@@ -404,30 +1222,57 @@ export default {
     try {
       const url = new URL(request.url);
 
-      if (request.method === "GET" && url.pathname === "/") {
-        return new Response("JEJE STORE BOT — online");
+      if (url.pathname === "/setup") {
+        return setupWebhook(env, request);
       }
 
-      if (request.method === "GET" && url.pathname === "/setup") {
-        const key = url.searchParams.get("key");
-        const webhookUrl = url.searchParams.get("url");
-        if (!key || key !== env.SETUP_SECRET) return new Response("Unauthorized", { status: 401 });
-        if (!webhookUrl) return new Response("Missing url", { status: 400 });
-        const result = await tg(env, "setWebhook", { url: `${webhookUrl.replace(/\/$/, "")}/telegram` });
-        return json(result);
+      if (url.pathname === "/") {
+        return new Response(
+          "JEJE STORE BOT is running.",
+          {
+            headers: {
+              "content-type": "text/plain"
+            }
+          }
+        );
       }
 
-      if (request.method === "POST" && url.pathname === "/telegram") {
-        const update = await request.json();
-        if (update.message) await handleMessage(update, env);
-        if (update.callback_query) await handleCallback(update, env);
-        return new Response("OK");
+      if (url.pathname !== "/webhook") {
+        return new Response("Not Found", {
+          status: 404
+        });
       }
 
-      return new Response("Not found", { status: 404 });
-    } catch (e) {
-      console.error(e);
-      return new Response("JEJE error", { status: 500 });
+      if (request.method !== "POST") {
+        return new Response("Method Not Allowed", {
+          status: 405
+        });
+      }
+
+      const update = await request.json();
+
+      if (update.callback_query) {
+        await handleCallback(env, update);
+      } else if (update.message) {
+        await handleMessage(env, update);
+      }
+
+      return new Response("OK");
+    } catch (error) {
+      console.error(error);
+
+      return new Response(
+        JSON.stringify({
+          ok: false,
+          error: String(error?.message || error)
+        }),
+        {
+          status: 500,
+          headers: {
+            "content-type": "application/json"
+          }
+        }
+      );
     }
-  },
+  }
 };
